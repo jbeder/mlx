@@ -6,14 +6,35 @@ from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.distributions import (
+    Normal as TorchNormal,
+    MultivariateNormal as TorchMVN,
+    Categorical,
+    MixtureSameFamily,
+)
 
 try:
-    from .utils import ensure_dir, gaussian2_logpdf, gaussian_logpdf, logsumexp, save_json  # type: ignore
+    from .utils import (
+        ensure_dir,
+        gaussian2_logpdf,
+        gaussian_logpdf,
+        logsumexp,
+        save_json,
+        OneDMixture2,
+    )  # type: ignore
 except Exception:
     import sys
     import os as _os
     sys.path.append(_os.path.dirname(__file__))
-    from utils import ensure_dir, gaussian2_logpdf, gaussian_logpdf, logsumexp, save_json  # type: ignore
+    from utils import (
+        ensure_dir,
+        gaussian2_logpdf,
+        gaussian_logpdf,
+        logsumexp,
+        save_json,
+        OneDMixture2,
+    )  # type: ignore
 
 
 def read_parquet(path: str) -> pd.DataFrame:
@@ -39,17 +60,14 @@ def load_model(model_dir: str) -> Dict:
 
 
 def nll_gaussian(x, mean, var):
-    var = np.maximum(var, 1e-12)
-    return 0.5 * (np.log(2 * np.pi * var) + (x - mean) ** 2 / var)
+    # Use torch.distributions via utils.gaussian_logpdf
+    return -gaussian_logpdf(np.array(x), np.array(mean), np.array(var))
 
 
 def nll_mixture2(x, mean, var0, var1, pi):
-    l0 = np.log(pi + 1e-12) - nll_gaussian(x, mean, var0)
-    l1 = np.log(1 - pi + 1e-12) - nll_gaussian(x, mean, var1)
-    ls = np.stack([l0, l1], axis=-1)
-    lse = np.max(ls, axis=-1, keepdims=True)
-    logp = lse.squeeze(-1) + np.log(np.sum(np.exp(ls - lse), axis=-1))
-    return -logp
+    # Use OneDMixture2 implemented on torch distributions
+    mix = OneDMixture2(pi=float(pi), mean=float(mean), var0=float(var0), var1=float(var1))
+    return -mix.logpdf(np.array(x))
 
 
 def crps_mc_perrow(sample_fn_list, y: np.ndarray, S: int = 64) -> np.ndarray:
@@ -92,7 +110,8 @@ def evaluate(model: Dict, df: pd.DataFrame, crps_S: int = 64, energy_M: int = 20
 
             def make_sampler(mu, var):
                 def samp(S):
-                    return np.random.normal(mu, np.sqrt(var), size=S)
+                    dist = TorchNormal(torch.as_tensor(mu, dtype=torch.float64), torch.sqrt(torch.as_tensor(var, dtype=torch.float64)))
+                    return dist.sample((S,)).numpy()
                 return samp
 
             up_samplers.append(make_sampler(mu_u, var_u))
@@ -111,8 +130,8 @@ def evaluate(model: Dict, df: pd.DataFrame, crps_S: int = 64, energy_M: int = 20
             mu_d_obs = a * up[i] + b
             nll_down[i] = nll_gaussian(down[i], mu_d_obs, var_d)
 
-            up_samplers.append(lambda S, mu=mu_u, var=var_u: np.random.normal(mu, np.sqrt(var), size=S))
-            down_samplers.append(lambda S, mu=mu_d_obs, var=var_d: np.random.normal(mu, np.sqrt(var), size=S))
+            up_samplers.append(lambda S, mu=mu_u, var=var_u: TorchNormal(torch.as_tensor(mu, dtype=torch.float64), torch.sqrt(torch.as_tensor(var, dtype=torch.float64))).sample((S,)).numpy())
+            down_samplers.append(lambda S, mu=mu_d_obs, var=var_d: TorchNormal(torch.as_tensor(mu, dtype=torch.float64), torch.sqrt(torch.as_tensor(var, dtype=torch.float64))).sample((S,)).numpy())
 
     elif cfg == "latent":
         params = model["params"]
@@ -137,9 +156,13 @@ def evaluate(model: Dict, df: pd.DataFrame, crps_S: int = 64, energy_M: int = 20
 
             def make_mix_sampler(mu, v0, v1, pi):
                 def samp(S):
-                    z = np.random.rand(S) < pi
-                    std = np.where(z, np.sqrt(v0), np.sqrt(v1))
-                    return np.random.normal(mu, std)
+                    cat = Categorical(probs=torch.as_tensor([pi, 1 - pi], dtype=torch.float64))
+                    comp = TorchNormal(
+                        loc=torch.as_tensor([mu, mu], dtype=torch.float64),
+                        scale=torch.sqrt(torch.as_tensor([v0, v1], dtype=torch.float64)),
+                    )
+                    mix = MixtureSameFamily(cat, comp)
+                    return mix.sample((S,)).numpy()
                 return samp
 
             up_samplers.append(make_mix_sampler(mu_u, var_u + var0, var_u + var1, pi))
@@ -157,29 +180,30 @@ def evaluate(model: Dict, df: pd.DataFrame, crps_S: int = 64, energy_M: int = 20
     if cfg == "gmm":
         for i in range(N):
             p = model["params"][str(src[i])] if str(src[i]) in model["params"] else model["params"][int(src[i])]
-            mean = np.array(p["mean"])  # (2,)
-            cov = np.array(p["cov"])   # (2,2)
-            L = np.linalg.cholesky(cov + 1e-12 * np.eye(2))
-            z = np.random.normal(size=2)
-            xy = mean + L @ z
-            up_hat[i], down_hat[i] = xy[0], xy[1]
+            mean = torch.as_tensor(p["mean"], dtype=torch.float64)
+            cov = torch.as_tensor(p["cov"], dtype=torch.float64)
+            dist = TorchMVN(loc=mean, covariance_matrix=cov + 1e-12 * torch.eye(2, dtype=cov.dtype))
+            sample = dist.sample()
+            up_hat[i], down_hat[i] = float(sample[0].item()), float(sample[1].item())
     elif cfg == "markov":
         for i in range(N):
             p = model["params"][str(src[i])] if str(src[i]) in model["params"] else model["params"][int(src[i])]
-            up_s = np.random.normal(p["up_mean"], np.sqrt(p["up_var"]))
-            down_s = np.random.normal(p["a"] * up_s + p["b"], np.sqrt(p["down_var"]))
+            up_dist = TorchNormal(torch.as_tensor(p["up_mean"], dtype=torch.float64), torch.sqrt(torch.as_tensor(p["up_var"], dtype=torch.float64)))
+            up_s = float(up_dist.sample().item())
+            down_dist = TorchNormal(torch.as_tensor(p["a"] * up_s + p["b"], dtype=torch.float64), torch.sqrt(torch.as_tensor(p["down_var"], dtype=torch.float64)))
+            down_s = float(down_dist.sample().item())
             up_hat[i], down_hat[i] = up_s, down_s
     elif cfg == "latent":
         sigma0 = model["sigma0"]
         sigma1 = model["sigma1"]
         for i in range(N):
             p = model["params"][str(src[i])] if str(src[i]) in model["params"] else model["params"][int(src[i])]
-            u = np.random.normal(p["mu_u"], np.sqrt(p["var_u"]))
-            v = np.random.normal(p["a"] * u + p["b"], np.sqrt(p["var_v"]))
-            z = np.random.rand() < p["pi"]
+            u = float(TorchNormal(torch.as_tensor(p["mu_u"], dtype=torch.float64), torch.sqrt(torch.as_tensor(p["var_u"], dtype=torch.float64))).sample().item())
+            v = float(TorchNormal(torch.as_tensor(p["a"] * u + p["b"], dtype=torch.float64), torch.sqrt(torch.as_tensor(p["var_v"], dtype=torch.float64))).sample().item())
+            z = bool(torch.rand(()) < torch.as_tensor(p["pi"], dtype=torch.float64))
             sig = sigma0 if z else sigma1
-            up_hat[i] = np.random.normal(u, sig)
-            down_hat[i] = np.random.normal(v, sig)
+            up_hat[i] = float(TorchNormal(torch.as_tensor(u, dtype=torch.float64), torch.as_tensor(sig, dtype=torch.float64)).sample().item())
+            down_hat[i] = float(TorchNormal(torch.as_tensor(v, dtype=torch.float64), torch.as_tensor(sig, dtype=torch.float64)).sample().item())
 
     # Joint rollout metrics
     def energy_distance(xy: np.ndarray, uv: np.ndarray, M: int = 2000) -> float:

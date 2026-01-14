@@ -2,37 +2,46 @@
 import argparse
 import json
 import os
-from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import Dataset
+from zuko.distributions import MultivariateNormal as ZMVN  # type: ignore
 
-try:
-    from .utils import ensure_dir, gaussian2_logpdf, gaussian_logpdf, logsumexp, save_json  # type: ignore
-except Exception:
-    import sys
-    import os as _os
-    sys.path.append(_os.path.dirname(__file__))
-    from utils import ensure_dir, gaussian2_logpdf, gaussian_logpdf, logsumexp, save_json  # type: ignore
+# Use zuko distributions for Gaussians as requested
+from zuko.distributions import Normal as ZNormal  # type: ignore
 
 
-def read_parquet(path: str) -> pd.DataFrame:
-    try:
-        return pd.read_parquet(path)
-    except Exception as e1:
-        # Fallback to duckdb python if available
-        try:
-            import duckdb  # type: ignore
+class SpeedDataset(Dataset):
+    """Torch dataset returning (source, upstream, downstream).
 
-            con = duckdb.connect()
-            df = con.execute(f"SELECT * FROM read_parquet('{path}')").df()
-            con.close()
-            return df
-        except Exception as e2:
-            raise RuntimeError(
-                f"Failed reading parquet {path}. Install pyarrow/fastparquet or duckdb. Errors: {e1} / {e2}"
-            )
+    - source: LongTensor [N]
+    - upstream: FloatTensor [N]
+    - downstream: FloatTensor [N]
+    """
+
+    def __init__(self, df: pd.DataFrame):
+        df = df[["id", "source", "upstream_speed", "downstream_speed"]].copy()
+        df["source"] = df["source"].astype(int)
+        # Store as tensors
+        self.src = torch.as_tensor(df["source"].to_numpy().astype(np.int64))
+        self.up = torch.as_tensor(df["upstream_speed"].to_numpy(), dtype=torch.float32)
+        self.down = torch.as_tensor(df["downstream_speed"].to_numpy(), dtype=torch.float32)
+
+    def __len__(self) -> int:  # type: ignore
+        return int(self.src.numel())
+
+    def __getitem__(self, idx: int):  # type: ignore
+        return int(self.src[idx].item()), float(self.up[idx].item()), float(self.down[idx].item())
+
+
+def load_data(path: str) -> SpeedDataset:
+    """Read parquet and return a torch Dataset instead of a DataFrame."""
+    df = pd.read_parquet(path)
+    return SpeedDataset(df)
 
 
 ############################################
@@ -40,22 +49,80 @@ def read_parquet(path: str) -> pd.DataFrame:
 ############################################
 
 
-def fit_gmm(df: pd.DataFrame) -> Dict:
-    params = {}
-    for s, g in df.groupby("source"):
-        x = g[["upstream_speed", "downstream_speed"]].to_numpy()
-        mean = x.mean(axis=0)
-        cov = np.cov(x.T, bias=False)
-        # Regularize covariance for stability
-        cov = cov + 1e-6 * np.eye(2)
-        params[int(s)] = {
-            "mean": mean.tolist(),
-            "cov": cov.tolist(),
-        }
-    return {
-        "config": "gmm",
-        "params": params,
-    }
+def fit_gmm(dataset: SpeedDataset, epochs: int = 300, lr: float = 0.05) -> Dict:
+    """Train a per-source 2D Gaussian with MLE using zuko MultivariateNormal.
+
+    We maintain learnable per-source mean (2,) and scale_tril (2x2) parameters and
+    optimize average NLL over the dataset.
+    """
+    src = dataset.src
+    up = dataset.up
+    down = dataset.down
+    x = torch.stack([up, down], dim=1)  # (N, 2)
+    S = int(src.max().item()) + 1
+
+    # Initialize from empirical stats
+    with torch.no_grad():
+        mean0 = torch.zeros(S, 2, dtype=torch.float32)
+        L0 = torch.zeros(S, 2, 2, dtype=torch.float32)
+        for s in range(S):
+            idx = src == s
+            xs = x[idx]
+            if xs.numel() == 0:
+                # Safe default
+                mean0[s] = 0.0
+                L0[s] = torch.eye(2)
+            else:
+                m = xs.mean(dim=0)
+                # unbiased covariance
+                xm = xs - m
+                cov = (xm.t() @ xm) / max(xs.shape[0] - 1, 1)
+                cov = cov + 1e-4 * torch.eye(2)
+                L = torch.linalg.cholesky(cov)
+                mean0[s] = m
+                L0[s] = L
+
+    mean = nn.Parameter(mean0.clone())
+    raw_L = nn.Parameter(L0.clone())  # We'll enforce lower-tri with positive diag using softplus
+
+    opt = torch.optim.Adam([mean, raw_L], lr=lr)
+    sp = torch.nn.Softplus()
+
+    for _ in range(epochs):
+        # Build batched scale_tril with positive diagonal
+        L = torch.tril(raw_L)
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        diag = sp(diag) + 1e-6
+        L = L.clone()
+        for i in range(S):
+            L[i, 0, 0] = diag[i, 0]
+            L[i, 1, 1] = diag[i, 1]
+
+        m_b = mean[src]
+        L_b = L[src]
+        dist = ZMVN(m_b, scale_tril=L_b)
+        loss = -dist.log_prob(x).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+    # Export learned parameters to JSON-friendly dict
+    with torch.no_grad():
+        L = torch.tril(raw_L)
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        diag = sp(diag) + 1e-6
+        for i in range(S):
+            L[i, 0, 0] = diag[i, 0]
+            L[i, 1, 1] = diag[i, 1]
+        cov = L @ L.transpose(-1, -2)
+        params: Dict[int, Dict] = {}
+        for s in range(S):
+            params[s] = {
+                "mean": mean[s].detach().cpu().numpy().astype(float).tolist(),
+                "cov": cov[s].detach().cpu().numpy().astype(float).tolist(),
+            }
+
+    return {"config": "gmm", "params": params}
 
 
 ############################################
@@ -63,31 +130,79 @@ def fit_gmm(df: pd.DataFrame) -> Dict:
 ############################################
 
 
-def fit_markov(df: pd.DataFrame) -> Dict:
-    params = {}
-    for s, g in df.groupby("source"):
-        up = g["upstream_speed"].to_numpy()
-        down = g["downstream_speed"].to_numpy()
-        mu = float(up.mean())
-        var = float(np.var(up, ddof=1))
-        X = np.stack([up, np.ones_like(up)], axis=1)
-        # Least squares for down ~ a*up + b
-        ab, _, _, _ = np.linalg.lstsq(X, down, rcond=None)
-        a = float(ab[0])
-        b = float(ab[1])
-        resid = down - (a * up + b)
-        var_d = float(np.var(resid, ddof=1) + 1e-6)
-        params[int(s)] = {
-            "up_mean": mu,
-            "up_var": max(var, 1e-6),
-            "a": a,
-            "b": b,
-            "down_var": var_d,
-        }
-    return {
-        "config": "markov",
-        "params": params,
-    }
+def fit_markov(dataset: SpeedDataset, epochs: int = 300, lr: float = 0.05) -> Dict:
+    """Train the Markov model (up ~ N; down|up ~ N(a*up+b, var)) via MLE using zuko Normals."""
+    src = dataset.src
+    up = dataset.up
+    down = dataset.down
+    S = int(src.max().item()) + 1
+
+    # Initialize with simple statistics / least squares
+    with torch.no_grad():
+        mu0 = torch.zeros(S, dtype=torch.float32)
+        log_std_u0 = torch.zeros(S, dtype=torch.float32)
+        a0 = torch.zeros(S, dtype=torch.float32)
+        b0 = torch.zeros(S, dtype=torch.float32)
+        log_std_d0 = torch.zeros(S, dtype=torch.float32)
+        for s in range(S):
+            idx = src == s
+            u = up[idx]
+            d = down[idx]
+            if u.numel() == 0:
+                continue
+            mu = u.mean()
+            var_u = u.var(unbiased=True) + 1e-6
+            X = torch.stack([u, torch.ones_like(u)], dim=1)
+            sol = torch.linalg.lstsq(X, d).solution
+            a = sol[0]
+            b = sol[1]
+            resid = d - (a * u + b)
+            var_d = resid.var(unbiased=True) + 1e-6
+            mu0[s] = mu
+            log_std_u0[s] = 0.5 * torch.log(var_u)
+            a0[s] = a
+            b0[s] = b
+            log_std_d0[s] = 0.5 * torch.log(var_d)
+
+    mu_u = nn.Parameter(mu0)
+    log_std_u = nn.Parameter(log_std_u0)
+    a = nn.Parameter(a0)
+    b = nn.Parameter(b0)
+    log_std_d = nn.Parameter(log_std_d0)
+    opt = torch.optim.Adam([mu_u, log_std_u, a, b, log_std_d], lr=lr)
+
+    for _ in range(epochs):
+        std_u = torch.exp(log_std_u)
+        std_d = torch.exp(log_std_d)
+        mu_u_b = mu_u[src]
+        std_u_b = std_u[src]
+        a_b = a[src]
+        b_b = b[src]
+        std_d_b = std_d[src]
+
+        up_dist = ZNormal(mu_u_b, std_u_b)
+        down_mu = a_b * up + b_b
+        down_dist = ZNormal(down_mu, std_d_b)
+        loss = -(up_dist.log_prob(up) + down_dist.log_prob(down)).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+    # Export
+    with torch.no_grad():
+        std_u = torch.exp(log_std_u)
+        std_d = torch.exp(log_std_d)
+        params: Dict[int, Dict] = {}
+        for s in range(S):
+            params[s] = {
+                "up_mean": float(mu_u[s].item()),
+                "up_var": float((std_u[s] ** 2).item()),
+                "a": float(a[s].item()),
+                "b": float(b[s].item()),
+                "down_var": float((std_d[s] ** 2).item()),
+            }
+
+    return {"config": "markov", "params": params}
 
 
 ############################################
@@ -96,157 +211,146 @@ def fit_markov(df: pd.DataFrame) -> Dict:
 
 
 def _prior_stats(mu_u: float, var_u: float, a: float, b: float, var_v: float):
-    m = np.array([mu_u, a * mu_u + b])
-    P = np.array(
+    """Prior stats as torch tensors (float64)."""
+    m = torch.as_tensor([mu_u, a * mu_u + b], dtype=torch.float64)
+    P = torch.as_tensor(
         [
             [var_u, a * var_u],
             [a * var_u, a * a * var_u + var_v],
-        ]
+        ],
+        dtype=torch.float64,
     )
     return m, P
 
 
-def _posterior_uv_given_xy(m: np.ndarray, P: np.ndarray, x: float, y: float, r_eff: float):
-    # Observation is identity with noise R = diag(r_eff, r_eff)
-    R = np.diag([r_eff, r_eff])
-    # Posterior covariance: (P^{-1} + R^{-1})^{-1}
-    Pinv = np.linalg.inv(P)
-    Rinv = np.linalg.inv(R)
-    Sigma = np.linalg.inv(Pinv + Rinv)
-    # Posterior mean: Sigma * (P^{-1} m + R^{-1} y)
-    yv = np.array([x, y])
+def _posterior_uv_given_xy(m: torch.Tensor, P: torch.Tensor, x: float, y: float, r_eff: float):
+    """Posterior for linear-Gaussian model with identity observation and noise diag(r_eff, r_eff).
+    Returns torch tensors (mu, Sigma).
+    """
+    R = torch.diag(torch.as_tensor([r_eff, r_eff], dtype=torch.float64))
+    Pinv = torch.linalg.inv(P)
+    Rinv = torch.linalg.inv(R)
+    Sigma = torch.linalg.inv(Pinv + Rinv)
+    yv = torch.as_tensor([x, y], dtype=torch.float64)
     mu = Sigma @ (Pinv @ m + Rinv @ yv)
     return mu, Sigma
 
 
-def fit_latent(df: pd.DataFrame, iters: int = 10) -> Dict:
-    S = int(df["source"].max()) + 1
-    # Initialize per-source parameters from observed heuristics
-    params = {}
-    for s, g in df.groupby("source"):
-        up = g["upstream_speed"].to_numpy()
-        down = g["downstream_speed"].to_numpy()
-        mu_u = float(up.mean())
-        var_u = float(np.var(up, ddof=1))
-        X = np.stack([up, np.ones_like(up)], axis=1)
-        ab, _, _, _ = np.linalg.lstsq(X, down, rcond=None)
-        a = float(ab[0])
-        b = float(ab[1])
-        resid = down - (a * up + b)
-        var_v = max(float(np.var(resid, ddof=1) - 0.1), 1e-3)
-        params[int(s)] = {
-            "mu_u": mu_u,
-            "var_u": max(var_u, 1e-3),
-            "a": a,
-            "b": b,
-            "var_v": var_v,
-            "pi": 0.5,
-        }
-    # Global sensor variances (initialized near the spec)
-    sigma0 = 0.3
-    sigma1 = 1.2
+def fit_latent(dataset: SpeedDataset, epochs: int = 200, lr: float = 0.05) -> Dict:
+    """Train the latent model via direct MLE of the marginal mixture using zuko MVNs.
 
-    # Pre-cache arrays
-    x_all = df["upstream_speed"].to_numpy()
-    y_all = df["downstream_speed"].to_numpy()
-    s_all = df["source"].to_numpy().astype(int)
-    N = len(df)
+    Marginal for (x, y) given source s is a mixture of two Gaussians with means
+    m_s = [mu_u, a*mu_u + b] and covariances P_s + sigma_k^2 I, where
+    P_s = [[var_u, a var_u], [a var_u, a^2 var_u + var_v]].
+    """
+    src = dataset.src
+    up = dataset.up
+    down = dataset.down
+    xy = torch.stack([up, down], dim=1)
+    S = int(src.max().item()) + 1
 
-    # Storage for responsibilities and posteriors
-    r0 = np.full(N, 0.5)
-    r1 = np.full(N, 0.5)
-    Eu = np.zeros(N)
-    Ev = np.zeros(N)
-    Eu2 = np.zeros(N)
-    Ev2 = np.zeros(N)
-    Euv = np.zeros(N)
-
-    for it in range(iters):
-        # E-step: responsibilities and posterior moments
-        logw0 = np.zeros(N)
-        logw1 = np.zeros(N)
+    # Initialize from simple heuristics
+    with torch.no_grad():
+        mu0 = torch.zeros(S, dtype=torch.float32)
+        log_var_u0 = torch.zeros(S, dtype=torch.float32)
+        a0 = torch.zeros(S, dtype=torch.float32)
+        b0 = torch.zeros(S, dtype=torch.float32)
+        log_var_v0 = torch.zeros(S, dtype=torch.float32)
+        raw_pi0 = torch.zeros(S, dtype=torch.float32)
         for s in range(S):
-            idx = np.where(s_all == s)[0]
-            if len(idx) == 0:
+            idx = src == s
+            u = up[idx]
+            d = down[idx]
+            if u.numel() == 0:
                 continue
-            p = params[s]
-            m, P = _prior_stats(p["mu_u"], p["var_u"], p["a"], p["b"], p["var_v"])
-            # Likelihood for z=0 and z=1 marginals
-            r0_s = sigma0 ** 2
-            r1_s = sigma1 ** 2
-            cov0 = P + np.diag([r0_s, r0_s])
-            cov1 = P + np.diag([r1_s, r1_s])
-            xy = np.stack([x_all[idx], y_all[idx]], axis=1)
-            l0 = gaussian2_logpdf(xy, m, cov0) + np.log(p["pi"] + 1e-12)
-            l1 = gaussian2_logpdf(xy, m, cov1) + np.log(1 - p["pi"] + 1e-12)
-            norm = logsumexp(np.stack([l0, l1], axis=1), axis=1)
-            r0[idx] = np.exp(l0 - norm)
-            r1[idx] = 1.0 - r0[idx]
+            mu = u.mean()
+            var_u = u.var(unbiased=True) + 1e-3
+            X = torch.stack([u, torch.ones_like(u)], dim=1)
+            sol = torch.linalg.lstsq(X, d).solution
+            aa = sol[0]
+            bb = sol[1]
+            resid = d - (aa * u + bb)
+            var_v = resid.var(unbiased=True) + 1e-3
+            mu0[s] = mu
+            log_var_u0[s] = torch.log(var_u)
+            a0[s] = aa
+            b0[s] = bb
+            log_var_v0[s] = torch.log(var_v)
+            raw_pi0[s] = 0.0  # sigmoid -> 0.5
 
-            # Effective measurement variance per row (mixing responsibilities)
-            r_eff = r0[idx] * r0_s + r1[idx] * r1_s
-            # Posterior moments
-            for j, n in enumerate(idx):
-                mu_post, Sigma_post = _posterior_uv_given_xy(m, P, x_all[n], y_all[n], r_eff[j])
-                Eu[n] = mu_post[0]
-                Ev[n] = mu_post[1]
-                Eu2[n] = Sigma_post[0, 0] + mu_post[0] ** 2
-                Ev2[n] = Sigma_post[1, 1] + mu_post[1] ** 2
-                Euv[n] = Sigma_post[0, 1] + mu_post[0] * mu_post[1]
+    mu_u = nn.Parameter(mu0)
+    log_var_u = nn.Parameter(log_var_u0)
+    a = nn.Parameter(a0)
+    b = nn.Parameter(b0)
+    log_var_v = nn.Parameter(log_var_v0)
+    raw_pi = nn.Parameter(raw_pi0)
+    raw_sigma0 = nn.Parameter(torch.tensor(-1.2, dtype=torch.float32))  # ~0.3 after softplus
+    raw_delta_sigma = nn.Parameter(torch.tensor(1.2, dtype=torch.float32))  # positive increment
 
-        # M-step: update per-source process params
+    opt = torch.optim.Adam([mu_u, log_var_u, a, b, log_var_v, raw_pi, raw_sigma0, raw_delta_sigma], lr=lr)
+    sp = torch.nn.Softplus()
+
+    I = torch.eye(2, dtype=torch.float32)
+    for _ in range(epochs):
+        # Parameters with constraints
+        var_u = torch.exp(log_var_u).clamp_min(1e-6)
+        var_v = torch.exp(log_var_v).clamp_min(1e-6)
+        pi = torch.sigmoid(raw_pi)  # (S,)
+        sigma0 = sp(raw_sigma0) + 1e-6
+        sigma1 = sigma0 + sp(raw_delta_sigma)  # enforce sigma1 >= sigma0
+
+        # Build per-source prior mean and covariance P
+        m_u = mu_u
+        m_v = a * mu_u + b
+        m = torch.stack([m_u, m_v], dim=1)  # (S, 2)
+        # P = [[var_u, a var_u], [a var_u, a^2 var_u + var_v]]
+        P = torch.zeros(S, 2, 2, dtype=torch.float32)
+        P[:, 0, 0] = var_u
+        P[:, 0, 1] = a * var_u
+        P[:, 1, 0] = a * var_u
+        P[:, 1, 1] = a * a * var_u + var_v
+
+        m_b = m[src]
+        P_b = P[src]
+        pi_b = pi[src]
+
+        cov0 = P_b + (sigma0**2) * I
+        cov1 = P_b + (sigma1**2) * I
+
+        dist0 = ZMVN(m_b, covariance_matrix=cov0)
+        dist1 = ZMVN(m_b, covariance_matrix=cov1)
+        l0 = torch.log(pi_b + 1e-12) + dist0.log_prob(xy)
+        l1 = torch.log(1.0 - pi_b + 1e-12) + dist1.log_prob(xy)
+        ll = torch.logsumexp(torch.stack([l0, l1], dim=1), dim=1)  # (N,)
+        loss = -ll.mean()
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        var_u = torch.exp(log_var_u).clamp_min(1e-6)
+        var_v = torch.exp(log_var_v).clamp_min(1e-6)
+        pi = torch.sigmoid(raw_pi)
+        sigma0 = float((sp(raw_sigma0) + 1e-6).item())
+        sigma1 = float((sp(raw_sigma0) + sp(raw_delta_sigma) + 1e-6).item())
+        params: Dict[int, Dict] = {}
         for s in range(S):
-            idx = np.where(s_all == s)[0]
-            if len(idx) == 0:
-                continue
-            mu_u = float(Eu[idx].mean())
-            # var_u as E[(u - mu)^2]
-            var_u = float((Eu2[idx].mean() - 2 * mu_u * Eu[idx].mean() + mu_u ** 2))
-            # Linear regression v ~ a u + b using expected sufficient stats
-            Eu_s = Eu[idx].mean()
-            Ev_s = Ev[idx].mean()
-            cov_uu = float(Eu2[idx].mean() - Eu_s ** 2)
-            cov_uv = float(Euv[idx].mean() - Eu_s * Ev_s)
-            a = 0.0
-            if cov_uu > 1e-12:
-                a = cov_uv / cov_uu
-            b = Ev_s - a * Eu_s
-            # var_v as E[(v - a u - b)^2]
-            Ev2m = Ev2[idx]
-            term = Ev2m - 2 * a * Euv[idx] - 2 * b * Ev[idx] + (a ** 2) * Eu2[idx] + 2 * a * b * Eu[idx] + b ** 2
-            var_v = float(max(term.mean(), 1e-6))
-            params[s].update({
-                "mu_u": mu_u,
-                "var_u": max(var_u, 1e-6),
-                "a": float(a),
-                "b": float(b),
-                "var_v": var_v,
-                "pi": float(r0[idx].mean()),
-            })
-
-        # Update global sensor variances using expected residuals
-        # E[(x - u)^2] = (x - E[u])^2 + Var(u|data), similarly for y-v
-        # Approximate Var(u|data) and Var(v|data) from Eu2 - Eu^2 etc.
-        var_u_post = np.maximum(Eu2 - Eu ** 2, 0.0)
-        var_v_post = np.maximum(Ev2 - Ev ** 2, 0.0)
-        exu2 = (x_all - Eu) ** 2 + var_u_post
-        evv2 = (y_all - Ev) ** 2 + var_v_post
-        num0 = np.sum(r0 * (exu2 + evv2) * 0.5)
-        den0 = np.sum(r0) + 1e-12
-        num1 = np.sum(r1 * (exu2 + evv2) * 0.5)
-        den1 = np.sum(r1) + 1e-12
-        sigma0 = float(np.sqrt(max(num0 / den0, 1e-6)))
-        sigma1 = float(np.sqrt(max(num1 / den1, 1e-6)))
-        # Enforce ordering sigma0 <= sigma1 for identifiability
-        if sigma0 > sigma1:
-            sigma0, sigma1 = sigma1, sigma0
+            params[s] = {
+                "mu_u": float(mu_u[s].item()),
+                "var_u": float(var_u[s].item()),
+                "a": float(a[s].item()),
+                "b": float(b[s].item()),
+                "var_v": float(var_v[s].item()),
+                "pi": float(pi[s].item()),
+            }
 
     return {
         "config": "latent",
         "params": params,
         "sigma0": sigma0,
         "sigma1": sigma1,
-        "iters": iters,
+        "iters": epochs,
     }
 
 
@@ -257,21 +361,20 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    df = read_parquet(args.data)
-    # Ensure correct dtypes
-    df = df[["id", "source", "upstream_speed", "downstream_speed"]].copy()
-    df["source"] = df["source"].astype(int)
+    dataset = load_data(args.data)
 
-    ensure_dir(args.out)
+    os.makedirs(args.out, exist_ok=True)
 
     if args.config == "gmm":
-        model = fit_gmm(df)
+        model = fit_gmm(dataset)
     elif args.config == "markov":
-        model = fit_markov(df)
+        model = fit_markov(dataset)
     else:
-        model = fit_latent(df)
+        model = fit_latent(dataset)
 
-    save_json(os.path.join(args.out, "model.json"), model)
+    with open(os.path.join(args.out, "model.json"), "w") as f:
+        json.dump(model, f, indent=2)
+
     print(f"Saved model to {os.path.join(args.out, 'model.json')}")
 
 
