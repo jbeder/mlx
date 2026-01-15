@@ -2,7 +2,7 @@
 import argparse
 import json
 import os
-from typing import Dict
+from typing import Dict, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,12 @@ from zuko.distributions import MultivariateNormal as ZMVN  # type: ignore
 
 # Use zuko distributions for Gaussians as requested
 from zuko.distributions import Normal as ZNormal  # type: ignore
+
+
+class SpeedBatch(NamedTuple):
+    source: torch.LongTensor  # (B,)
+    upstream: torch.FloatTensor  # (B,)
+    downstream: torch.FloatTensor  # (B,)
 
 
 class SpeedDataset(Dataset):
@@ -27,19 +33,23 @@ class SpeedDataset(Dataset):
         df = df[["id", "source", "upstream_speed", "downstream_speed"]].copy()
         df["source"] = df["source"].astype(int)
         # Store as tensors
-        self.src = torch.as_tensor(df["source"].to_numpy().astype(np.int64))
-        self.up = torch.as_tensor(df["upstream_speed"].to_numpy(), dtype=torch.float32)
-        self.down = torch.as_tensor(df["downstream_speed"].to_numpy(), dtype=torch.float32)
+        self.source = torch.as_tensor(df["source"].to_numpy().astype(np.int64))
+        self.upstream = torch.as_tensor(df["upstream_speed"].to_numpy(), dtype=torch.float32)
+        self.downstream = torch.as_tensor(df["downstream_speed"].to_numpy(), dtype=torch.float32)
 
     def __len__(self) -> int:  # type: ignore
-        return int(self.src.numel())
+        return int(self.source.numel())
 
-    def __getitem__(self, idx: int):  # type: ignore
-        return int(self.src[idx].item()), float(self.up[idx].item()), float(self.down[idx].item())
+    def __getitem__(self, idx):
+        return SpeedBatch(
+            source=self.source[idx],
+            upstream=self.upstream[idx],
+            downstream=self.downstream[idx],
+        )
 
 
 def load_data(path: str) -> SpeedDataset:
-    """Read parquet and return a torch Dataset instead of a DataFrame."""
+    """Read parquet and return a torch Dataset."""
     df = pd.read_parquet(path)
     return SpeedDataset(df)
 
@@ -55,18 +65,18 @@ def fit_gmm(dataset: SpeedDataset, epochs: int = 300, lr: float = 0.05) -> Dict:
     We maintain learnable per-source mean (2,) and scale_tril (2x2) parameters and
     optimize average NLL over the dataset.
     """
-    src = dataset.src
-    up = dataset.up
-    down = dataset.down
-    x = torch.stack([up, down], dim=1)  # (N, 2)
-    S = int(src.max().item()) + 1
+    source = dataset.source
+    upstream = dataset.upstream
+    downstream = dataset.downstream
+    x = torch.stack([upstream, downstream], dim=1)  # (N, 2)
+    S = int(source.max().item()) + 1
 
     # Initialize from empirical stats
     with torch.no_grad():
         mean0 = torch.zeros(S, 2, dtype=torch.float32)
         L0 = torch.zeros(S, 2, 2, dtype=torch.float32)
         for s in range(S):
-            idx = src == s
+            idx = source == s
             xs = x[idx]
             if xs.numel() == 0:
                 # Safe default
@@ -98,8 +108,8 @@ def fit_gmm(dataset: SpeedDataset, epochs: int = 300, lr: float = 0.05) -> Dict:
             L[i, 0, 0] = diag[i, 0]
             L[i, 1, 1] = diag[i, 1]
 
-        m_b = mean[src]
-        L_b = L[src]
+        m_b = mean[source]
+        L_b = L[source]
         dist = ZMVN(m_b, scale_tril=L_b)
         loss = -dist.log_prob(x).mean()
         opt.zero_grad()
