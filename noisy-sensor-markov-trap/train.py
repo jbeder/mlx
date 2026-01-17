@@ -9,9 +9,10 @@ from typing import TypeVar
 import pandas as pd
 import torch
 import torch.nn as nn
-from config import AppConfig, load_config
-from model import JointGaussianModel, LatentModel, MarkovModel, SpeedDataset
 from torch.utils.data import DataLoader, Dataset
+
+from .config import AppConfig, load_config
+from .model import JointGaussianModel, LatentModel, MarkovModel, SpeedDataset
 
 T = TypeVar("T")
 
