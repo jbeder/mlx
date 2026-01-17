@@ -33,9 +33,7 @@ def _infer_num_sources(df: pd.DataFrame) -> int:
     return int(df["source"].max()) + 1
 
 
-def _make_model(cfg: AppConfig, num_sources: int) -> nn.Module:
-    kind = cfg.model.kind
-
+def _make_model(cfg: AppConfig, num_sources: int, kind: str) -> nn.Module:
     if kind == "gmm":
         return JointGaussianModel(num_sources=num_sources)
 
@@ -59,18 +57,23 @@ def _make_model(cfg: AppConfig, num_sources: int) -> nn.Module:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True)
+    ap.add_argument("--config", type=str, required=True, help="Path to model/config YAML (no run info)")
+    ap.add_argument("--model", type=str, required=True, choices=["gmm", "markov", "latent"], help="Model kind")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    ap.add_argument("--device", type=str, default="auto", help="torch device, e.g. cpu|cuda|auto (default: auto)")
+    ap.add_argument("--data", type=str, required=True, help="Input parquet file path")
+    ap.add_argument("--out_dir", type=str, required=True, help="Output directory for model + metrics")
     args = ap.parse_args()
 
     cfg = load_config(args.config, AppConfig)
 
-    out_dir = Path(cfg.run.out_dir)
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    _seed_all(cfg.run.seed)
-    device = _get_device(cfg.run.device)
+    _seed_all(args.seed)
+    device = _get_device(args.device)
 
-    df = pd.read_parquet(cfg.run.data)
+    df = pd.read_parquet(args.data)
     num_sources = _infer_num_sources(df)
 
     ds: Dataset = SpeedDataset(df)
@@ -83,7 +86,7 @@ def main() -> None:
         pin_memory=bool(cfg.dataloader.pin_memory) and (device.type == "cuda"),
     )
 
-    model = _make_model(cfg, num_sources=num_sources).to(device)
+    model = _make_model(cfg, num_sources=num_sources, kind=args.model).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
 
     for epoch in range(cfg.train.epochs):
@@ -98,18 +101,18 @@ def main() -> None:
 
             opt.zero_grad(set_to_none=True)
 
-            if cfg.model.kind == "gmm":
+            if args.model == "gmm":
                 dist = model(source)
                 y = torch.stack([upstream_speed, downstream_speed], dim=-1)
                 loss = (-dist.log_prob(y)).mean()
 
-            elif cfg.model.kind == "markov":
+            elif args.model == "markov":
                 up_dist, down_dist = model(source, upstream_speed)
                 u = upstream_speed.unsqueeze(-1)
                 d = downstream_speed.unsqueeze(-1)
                 loss = ((-up_dist.log_prob(u)) + (-down_dist.log_prob(d))).mean()
 
-            elif cfg.model.kind == "latent":
+            elif args.model == "latent":
                 loss = model.loss(
                     source,
                     upstream_speed,
@@ -117,7 +120,7 @@ def main() -> None:
                     num_samples=cfg.model.latent.elbo_samples,
                 )
             else:
-                raise ValueError(cfg.model.kind)
+                raise ValueError(args.model)
 
             loss.backward()
 
@@ -134,6 +137,11 @@ def main() -> None:
 
     payload = {
         "config_path": args.config,
+        "model_kind": args.model,
+        "seed": args.seed,
+        "device": str(device),
+        "data": args.data,
+        "out_dir": str(out_dir),
         "num_sources": num_sources,
         "state_dict": model.state_dict(),
     }

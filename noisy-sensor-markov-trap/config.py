@@ -127,14 +127,6 @@ def _coerce_union(args: Tuple[Any, ...], value: Any, *, path: str) -> Any:
 
 
 @dataclass(frozen=True)
-class RunConfig:
-    seed: int
-    device: str
-    data: str
-    out_dir: str
-
-
-@dataclass(frozen=True)
 class DataLoaderConfig:
     batch_size: int
     shuffle: bool
@@ -176,7 +168,6 @@ class LatentModelConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    kind: Literal["gmm", "markov", "latent"]
     gmm: GMMModelConfig
     markov: MarkovModelConfig
     latent: LatentModelConfig
@@ -184,7 +175,6 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    run: RunConfig
     dataloader: DataLoaderConfig
     train: TrainConfig
     optim: OptimConfig

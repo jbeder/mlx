@@ -37,7 +37,14 @@ In mode=noisy
 
 ## Model
 
-`train.py [--config=gmm|markov|latent] --data=<filename.parquet> --out=<model_dir>`
+```
+python -m noisy-sensor-markov-trap.train \
+  --config noisy-sensor-markov-trap/config.yaml \
+  --model gmm|markov|latent \
+  --data <filename.parquet> \
+  --out_dir <model_dir> \
+  [--seed 42] [--device auto]
+```
 
 Train on rows `(source, upstream_speed, downstream_speed)`.
 
@@ -45,7 +52,7 @@ Train on rows `(source, upstream_speed, downstream_speed)`.
 - `upstream_speed`: observed upstream sensor value
 - `downstream_speed`: observed downstream sensor value
 
-All configs should provide:
+All models should provide:
 
 - `log_prob(source, upstream_speed, downstream_speed)` for evaluation
 - `sample(source)` for rollout (returns `(upstream_speed, downstream_speed)`)
