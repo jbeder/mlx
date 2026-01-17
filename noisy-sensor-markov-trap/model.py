@@ -32,19 +32,20 @@ class SpeedDataset(Dataset):
 
 
 class JointGaussianModel(nn.Module):
-    def __init__(self, num_sources: int):
+    def __init__(self, num_sources: int, emb_dim: int = 8, num_components: int = 2):
         super().__init__()
-        self.num_sources = num_sources
+        self.source_emb = nn.Embedding(num_sources, emb_dim)
         self.gmm = zuko.GMM(
             features=2,
-            context=num_sources,
-            components=1,
+            context=emb_dim,
+            components=num_components,
             covariance_type="full",
             epsilon=1e-6,
         )
 
     def forward(self, source: torch.Tensor) -> Distribution:
-        return self.gmm(context=nn.functional.one_hot(source, num_classes=self.num_sources).float())
+        ctx = self.source_emb(source)  # (B, emb_dim)
+        return self.gmm(ctx)
 
 
 class MarkovModel(nn.Module):
