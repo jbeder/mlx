@@ -48,29 +48,68 @@ class JointGaussianModel(nn.Module):
         return self.gmm(ctx)
 
 
+class MarkovRollout(NamedTuple):
+    upstream: Distribution
+    upstream_sample: torch.Tensor  # (B, 1)
+    downstream: Distribution
+    downstream_sample: torch.Tensor  # (B, 1)
+
+
 class MarkovModel(nn.Module):
     def __init__(self, num_sources: int, emb_dim: int = 8, num_components: int = 2):
         super().__init__()
-        self.num_sources = num_sources
         self.source_emb = nn.Embedding(num_sources, emb_dim)
+
         self.upstream = zuko.GMM(
             features=1,
             context=emb_dim,
             components=num_components,
-            covariance_type="full",
+            covariance_type="diag",
             epsilon=1e-6,
         )
         self.downstream = zuko.GMM(
             features=1,
             context=emb_dim + 1,
             components=num_components,
-            covariance_type="full",
+            covariance_type="diag",
             epsilon=1e-6,
         )
 
-    def forward(self, source: torch.Tensor) -> Distribution:
-        source_feat = self.source_emb(source)  # (B, emb_dim)
-        upstream = self.upstream(context=source_feat)
-        upstream_sample = upstream.rsample()  # Use rsample to allow gradients to flow
-        downstream = self.downstream(context=torch.cat([source_feat, upstream_sample], dim=-1))
-        return upstream, downstream  # TODO
+    def forward(self, source: torch.Tensor, upstream_speed: torch.Tensor):
+        """
+        Downstream is conditioned on observed upstream (teacher forcing).
+
+        Args:
+            source: (B,)
+            upstream_speed: (B,)
+        """
+        ctx = self.source_emb(source)  # (B, emb_dim)
+        up_dist = self.upstream(ctx)
+
+        u = upstream_speed.unsqueeze(-1)  # (B, 1)
+        down_dist = self.downstream(torch.cat([ctx, u], dim=-1))
+        return up_dist, down_dist
+
+    @torch.no_grad()
+    def rollout(self, source: torch.Tensor) -> MarkovRollout:
+        """
+        Rollout by sampling upstream speed.
+
+        Args:
+            source: (B,)
+        """
+        ctx = self.source_emb(source)
+        up = self.upstream(ctx)
+        u = up.sample()
+        if u.dim() == 1:
+            u = u.unsqueeze(-1)
+        down = self.downstream(torch.cat([ctx, u], dim=-1))
+        d = down.sample()
+        if d.ndim == 1:
+            d = d.unsqueeze(-1)  # (B, 1)
+        return MarkovRollout(
+            upstream=up,
+            upstream_sample=u,
+            downstream=down,
+            downstream_sample=d,
+        )
