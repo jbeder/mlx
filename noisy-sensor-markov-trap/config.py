@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Dict, List, Literal, Mapping, Tuple, Type, TypeVar, Union, get_args, get_origin
+from typing import Any, Dict, List, Literal, Mapping, Tuple, Type, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -32,13 +32,17 @@ def decode_dataclass(cls: Type[T], data: Any, *, path: str) -> T:
     if extra:
         raise ConfigError(f"{path} has unknown keys: {extra}")
 
+    # Resolve type hints to concrete types (handles postponed evaluation from 'from __future__ import annotations')
+    type_hints = get_type_hints(cls)
+
     for f in fields(cls):
         key = f.name
         fpath = f"{path}.{key}"
         if key not in data_map:
             raise ConfigError(f"Missing required key: {fpath}")
 
-        out_kwargs[key] = _coerce(f.type, data_map[key], path=fpath)
+        tp = type_hints.get(key, f.type)
+        out_kwargs[key] = _coerce(tp, data_map[key], path=fpath)
 
     return cls(**out_kwargs)  # type: ignore[arg-type]
 
