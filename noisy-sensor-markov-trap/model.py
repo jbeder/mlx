@@ -2,10 +2,10 @@ from typing import NamedTuple
 
 import pandas as pd
 import torch
-import zuko
 from torch import nn
 from torch.distributions import Distribution
 from torch.utils.data import Dataset
+from zuko.mixtures import GMM
 
 
 class SpeedBatch(NamedTuple):
@@ -35,7 +35,7 @@ class JointGaussianModel(nn.Module):
     def __init__(self, num_sources: int, emb_dim: int = 8, num_components: int = 2):
         super().__init__()
         self.source_emb = nn.Embedding(num_sources, emb_dim)
-        self.gmm = zuko.GMM(
+        self.gmm = GMM(
             features=2,
             context=emb_dim,
             components=num_components,
@@ -60,18 +60,18 @@ class MarkovModel(nn.Module):
         super().__init__()
         self.source_emb = nn.Embedding(num_sources, emb_dim)
 
-        self.upstream = zuko.GMM(
+        self.upstream = GMM(
             features=1,
             context=emb_dim,
             components=num_components,
-            covariance_type="diag",
+            covariance_type="diagonal",
             epsilon=1e-6,
         )
-        self.downstream = zuko.GMM(
+        self.downstream = GMM(
             features=1,
             context=emb_dim + 1,
             components=num_components,
-            covariance_type="diag",
+            covariance_type="diagonal",
             epsilon=1e-6,
         )
 
@@ -148,18 +148,18 @@ class LatentModel(nn.Module):
         self.source_emb = nn.Embedding(num_sources, emb_dim)
 
         # Latent process model
-        self.prior_u = zuko.GMM(
+        self.prior_u = GMM(
             features=1,
             context=emb_dim,
             components=num_components,
-            covariance_type="diag",
+            covariance_type="diagonal",
             epsilon=1e-6,
         )
-        self.prior_v = zuko.GMM(
+        self.prior_v = GMM(
             features=1,
             context=emb_dim + 1,
             components=num_components,
-            covariance_type="diag",
+            covariance_type="diagonal",
             epsilon=1e-6,
         )
 
