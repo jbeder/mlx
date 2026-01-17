@@ -49,26 +49,27 @@ class JointGaussianModel(nn.Module):
 
 
 class MarkovModel(nn.Module):
-    def __init__(self, num_sources: int):
+    def __init__(self, num_sources: int, emb_dim: int = 8, num_components: int = 2):
         super().__init__()
         self.num_sources = num_sources
+        self.source_emb = nn.Embedding(num_sources, emb_dim)
         self.upstream = zuko.GMM(
             features=1,
-            context=num_sources,
-            components=1,
+            context=emb_dim,
+            components=num_components,
             covariance_type="full",
             epsilon=1e-6,
         )
         self.downstream = zuko.GMM(
             features=1,
-            context=num_sources + 1,
-            components=1,
+            context=emb_dim + 1,
+            components=num_components,
             covariance_type="full",
             epsilon=1e-6,
         )
 
     def forward(self, source: torch.Tensor) -> Distribution:
-        source_feat = nn.functional.one_hot(source, num_classes=self.num_sources).float()
+        source_feat = self.source_emb(source)  # (B, emb_dim)
         upstream = self.upstream(context=source_feat)
         upstream_sample = upstream.rsample()  # Use rsample to allow gradients to flow
         downstream = self.downstream(context=torch.cat([source_feat, upstream_sample], dim=-1))
