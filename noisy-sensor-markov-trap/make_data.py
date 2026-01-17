@@ -3,15 +3,7 @@ import argparse
 import os
 
 import numpy as np
-
-try:
-    # Support running as a script
-    from .utils import set_seed  # type: ignore
-except Exception:
-    import sys
-
-    sys.path.append(os.path.dirname(__file__))
-    from utils import set_seed  # type: ignore
+from duckdb import torch
 
 
 def drag(v: np.ndarray, c: float) -> np.ndarray:
@@ -19,7 +11,8 @@ def drag(v: np.ndarray, c: float) -> np.ndarray:
 
 
 def generate_data(mode: str, seed: int, sources: int, count: int):
-    set_seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     # Per-source parameters
     mus = np.random.uniform(90.0, 100.0, size=sources)
