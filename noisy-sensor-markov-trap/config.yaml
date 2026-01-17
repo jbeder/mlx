@@ -1,0 +1,40 @@
+# config.yaml
+
+run:
+    seed: 42
+    device: auto          # auto|cpu|cuda
+    data: data.parquet
+    out_dir: runs/demo
+
+dataloader:
+    batch_size: 256
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+    pin_memory: false
+
+train:
+    epochs: 50
+    grad_clip: 0.0        # 0 disables
+
+optim:
+    lr: 3.0e-4
+    weight_decay: 0.0
+
+model:
+    kind: latent          # gmm|markov|latent
+
+    gmm:
+        # joint over (upstream_speed, downstream_speed)
+        # (your JointGaussianModel currently only takes num_sources; keep this here if you later add knobs)
+        dummy: 0
+
+    markov:
+        emb_dim: 8
+        num_components: 2
+
+    latent:
+        emb_dim: 8
+        num_components: 2
+        encoder_hidden: 64
+        elbo_samples: 1    # samples per batch for ELBO estimate
