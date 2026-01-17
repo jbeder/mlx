@@ -17,13 +17,13 @@ class SpeedBatch(NamedTuple):
 class SpeedDataset(Dataset):
     def __init__(self, data: pd.DataFrame):
         self.source = torch.as_tensor(data["source"].to_numpy(), dtype=torch.long)
-        self.upstream_speed = torch.as_tensor(data["upstream_speed"].to_numpy(), dtype=torch.float)
-        self.downstream_speed = torch.as_tensor(data["downstream_speed"].to_numpy(), dtype=torch.float)
+        self.upstream_speed = torch.as_tensor(data["upstream_speed"].to_numpy(), dtype=torch.float32)
+        self.downstream_speed = torch.as_tensor(data["downstream_speed"].to_numpy(), dtype=torch.float32)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.source)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> SpeedBatch:
         return SpeedBatch(
             source=self.source[idx],
             upstream_speed=self.upstream_speed[idx],
@@ -71,4 +71,4 @@ class MarkovModel(nn.Module):
         upstream = self.upstream(context=source_feat)
         upstream_sample = upstream.rsample()  # Use rsample to allow gradients to flow
         downstream = self.downstream(context=torch.cat([source_feat, upstream_sample], dim=-1))
-        return upstream, downstream # TODO
+        return upstream, downstream  # TODO
