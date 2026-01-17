@@ -2,6 +2,9 @@ from typing import NamedTuple
 
 import pandas as pd
 import torch
+import zuko
+from torch import nn
+from torch.distributions import Distribution
 from torch.utils.data import Dataset
 
 
@@ -26,3 +29,19 @@ class SpeedDataset(Dataset):
             upstream_speed=self.upstream_speed[idx],
             downstream_speed=self.downstream_speed[idx],
         )
+
+
+class JointGaussianModel(nn.Module):
+    def __init__(self, num_sources: int):
+        super().__init__()
+        self.num_sources = num_sources
+        self.gmm = zuko.GMM(
+            features=2,
+            context=num_sources,
+            components=1,
+            covariance_type="full",
+            epsilon=1e-6,
+        )
+
+    def forward(self, source: torch.Tensor) -> Distribution:
+        return self.gmm(context=nn.functional.one_hot(source, num_classes=self.num_sources).float())
