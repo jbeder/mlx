@@ -124,9 +124,9 @@ Rollout:
 
 ## Eval
 
-eval.py --data=<filename.parquet> --model=<model_dir> --out=<metrics.json>
+python -m markov_rollout_trap.eval --data=<filename.parquet> --model=<model_dir>
 
-Compute metrics for each `(data_mode, model_config)` pair. Report separately for `upstream_speed` and `downstream_speed`.
+Compute metrics for each `(data_mode, model_config)` pair. Report separately for `upstream_speed` and `downstream_speed`. Writes a new file /eval/metrics.json to the model directory.
 
 ### Per-speed distributional fit
 
