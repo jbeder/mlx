@@ -2,7 +2,7 @@
 
 ## Data
 
-make_data.py [--mode=clean|noisy] --seed=<seed> --sources=<K> --count=<N> --out=<filename.parquet>
+python -m markov_rollout_trap.make_data [--mode=clean|noisy] --seed=<seed> --sources=<K> --count=<N> --out=<filename.parquet>
 
 Defaults: seed=42, sources=10, count=10000
 
@@ -38,8 +38,8 @@ In mode=noisy
 ## Model
 
 ```
-python -m noisy-sensor-markov-trap.train \
-  --config noisy-sensor-markov-trap/config.yaml \
+python -m markov_rollout_trap.train \
+  --config markov_rollout_trap/config.yaml \
   --model gmm|markov|latent \
   --data <filename.parquet> \
   --out_dir <model_dir> \
