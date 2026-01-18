@@ -350,8 +350,20 @@ def _aggregate_metrics(
         return float(d.mean())
 
     cross = pairwise_mean_norm(X, Y)
-    within_x = pairwise_mean_norm(X, X)
-    within_y = pairwise_mean_norm(Y, Y)
+
+    # Unbiased within-set terms: exclude diagonal (self-pairs) and normalize by m*(m-1)
+    if m >= 2:
+        diff_xx = X[:, None, :] - X[None, :, :]
+        Dxx = np.sqrt((diff_xx * diff_xx).sum(axis=-1))
+        mask = ~np.eye(m, dtype=bool)
+        within_x = float(Dxx[mask].mean())
+
+        diff_yy = Y[:, None, :] - Y[None, :, :]
+        Dyy = np.sqrt((diff_yy * diff_yy).sum(axis=-1))
+        within_y = float(Dyy[mask].mean())
+    else:
+        within_x = 0.0
+        within_y = 0.0
     joint_energy = 2.0 * cross - within_x - within_y
 
     # Other rollout stats over full population
@@ -447,10 +459,20 @@ def main() -> None:
     Y = np.stack([up_hat[idx], down_hat[idx]], axis=1)
     diff_xy = X[:, None, :] - Y[None, :, :]
     cross = float(np.sqrt((diff_xy * diff_xy).sum(axis=-1)).mean())
-    diff_xx = X[:, None, :] - X[None, :, :]
-    within_x = float(np.sqrt((diff_xx * diff_xx).sum(axis=-1)).mean())
-    diff_yy = Y[:, None, :] - Y[None, :, :]
-    within_y = float(np.sqrt((diff_yy * diff_yy).sum(axis=-1)).mean())
+
+    # Unbiased within-set terms: exclude diagonal pairs and use mean over m*(m-1)
+    if m >= 2:
+        diff_xx = X[:, None, :] - X[None, :, :]
+        Dxx = np.sqrt((diff_xx * diff_xx).sum(axis=-1))
+        mask = ~np.eye(m, dtype=bool)
+        within_x = float(Dxx[mask].mean())
+
+        diff_yy = Y[:, None, :] - Y[None, :, :]
+        Dyy = np.sqrt((diff_yy * diff_yy).sum(axis=-1))
+        within_y = float(Dyy[mask].mean())
+    else:
+        within_x = 0.0
+        within_y = 0.0
     joint_energy = 2.0 * cross - within_x - within_y
 
     # Patch rollout metrics
