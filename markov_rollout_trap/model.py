@@ -91,33 +91,11 @@ def _gmm_1d_log_prob(dist: Distribution, x: torch.Tensor, dim_index: int) -> tor
     Returns:
       (B,)
     """
-    # Support torch.distributions.MixtureSameFamily and zuko.distributions.Mixture
-    if hasattr(dist, "mixture_distribution") and hasattr(dist, "component_distribution"):
-        mix = dist.mixture_distribution
-        comp = dist.component_distribution
-        # Mixture logits
-        if hasattr(mix, "logits") and mix.logits is not None:
-            logit_w = mix.logits
-        elif hasattr(mix, "probs") and mix.probs is not None:
-            logit_w = (mix.probs + 1e-12).log()
-        else:
-            raise AttributeError("Unsupported mixture: missing logits/probs")
-        mu = comp.loc[..., dim_index]  # (B,K)
-        var = comp.covariance_matrix[..., dim_index, dim_index]
-        std = var.clamp_min(1e-12).sqrt()  # (B,K)
-    elif hasattr(dist, "base") and hasattr(dist, "logits"):
-        base = dist.base  # MultivariateNormal batch (B,K), event (2)
-        logit_w = dist.logits  # (B,K)
-        mu = base.loc[..., dim_index]  # (B,K)
-        if hasattr(base, "covariance_matrix"):
-            var = base.covariance_matrix[..., dim_index, dim_index]
-        else:
-            # Fallback to scale_tril
-            L = base.scale_tril  # (...,2,2)
-            var = (L[..., dim_index, :] ** 2).sum(dim=-1)
-        std = var.clamp_min(1e-12).sqrt()
-    else:
-        raise AttributeError("Unsupported GMM distribution: missing mixture/components attributes")
+    base = dist.base
+    logit_w = dist.logits  # (B,K)
+    mu = base.loc[..., dim_index]  # (B,K)
+    var = base.covariance_matrix[..., dim_index, dim_index]
+    std = var.clamp_min(1e-12).sqrt()  # (B,K)
 
     x_ = x.unsqueeze(-1)  # (B,1)
     comp_lp = torch.distributions.Normal(mu, std).log_prob(x_)  # (B,K)
@@ -144,29 +122,10 @@ def _gmm_conditional_1d(
       MixtureSameFamily over Normal with batch (B,) and event dim scalar representing
       the conditional distribution.
     """
-    # Gather parameters for both torch and zuko Mixture variants
-    if hasattr(dist, "mixture_distribution") and hasattr(dist, "component_distribution"):
-        mix = dist.mixture_distribution
-        comp = dist.component_distribution
-        if hasattr(mix, "logits") and mix.logits is not None:
-            logit_w = mix.logits
-        elif hasattr(mix, "probs") and mix.probs is not None:
-            logit_w = (mix.probs + 1e-12).log()
-        else:
-            raise AttributeError("Unsupported mixture: missing logits/probs")
-        mu = comp.loc  # (B,K,2)
-        cov = comp.covariance_matrix  # (B,K,2,2)
-    elif hasattr(dist, "base") and hasattr(dist, "logits"):
-        base = dist.base
-        logit_w = dist.logits
-        mu = base.loc
-        if hasattr(base, "covariance_matrix"):
-            cov = base.covariance_matrix
-        else:
-            L = base.scale_tril
-            cov = L @ L.transpose(-1, -2)
-    else:
-        raise AttributeError("Unsupported GMM distribution: missing mixture/base attributes")
+    base = dist.base
+    logit_w = dist.logits
+    mu = base.loc  # (B,K,2)
+    cov = base.covariance_matrix  # (B,K,2,2)
 
     mu_u = mu[..., given_dim]  # (B,K)
     mu_d = mu[..., target_dim]  # (B,K)
