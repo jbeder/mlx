@@ -167,15 +167,11 @@ def _compute_metrics_gmm(
     up_hat = y_hat[..., 0].cpu().numpy()
     down_hat = y_hat[..., 1].cpu().numpy()
 
-    return _aggregate_metrics(
-        df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
-    )
+    return _aggregate_metrics(df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k)
 
 
 @torch.no_grad()
-def _compute_metrics_markov(
-    model: MarkovModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000
-) -> Dict:
+def _compute_metrics_markov(model: MarkovModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000) -> Dict:
     device = next(model.parameters()).device
 
     source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
@@ -199,9 +195,7 @@ def _compute_metrics_markov(
     up_hat = ro.upstream_sample.squeeze(-1).cpu().numpy()
     down_hat = ro.downstream_sample.squeeze(-1).cpu().numpy()
 
-    return _aggregate_metrics(
-        df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
-    )
+    return _aggregate_metrics(df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k)
 
 
 @torch.no_grad()
@@ -317,9 +311,7 @@ def _latent_samples_down(model: LatentModel, source: torch.Tensor, num_samples: 
 
 
 @torch.no_grad()
-def _compute_metrics_latent(
-    model: LatentModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000
-) -> Dict:
+def _compute_metrics_latent(model: LatentModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000) -> Dict:
     device = next(model.parameters()).device
 
     source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
@@ -343,56 +335,7 @@ def _compute_metrics_latent(
     up_hat = ro.upstream.cpu().numpy()
     down_hat = ro.downstream.cpu().numpy()
 
-    return _aggregate_metrics(
-        df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
-    )
-
-
-@torch.no_grad()
-def _latent_samples_joint(
-    model: LatentModel, source: torch.Tensor, num_samples: int, shared_k: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Joint sampler for (xu, xd) with optional shared sensor regime k across both sensors.
-
-    Args:
-      source: (B,)
-      num_samples: number of MC samples S
-      shared_k: if True, draws one k per row shared by upstream and downstream; if False, independent per (S,B)
-
-    Returns:
-      (xu_samples, xd_samples) each of shape (S,B)
-    """
-    device = source.device
-    ctx = model.source_emb(source)  # (B,E)
-    p_u = model.prior_u(ctx)
-    u = p_u.sample((num_samples,))  # (S,B,1) or (S,B)
-    if u.dim() == 2:
-        u = u.unsqueeze(-1)
-
-    S, B = u.shape[0], u.shape[1]
-    ctx_rep = ctx.unsqueeze(0).expand(S, B, -1)  # (S,B,E)
-    pv_ctx = torch.cat([ctx_rep, u], dim=-1)  # (S,B,E+1)
-    pv_ctx_flat = pv_ctx.reshape(S * B, -1)
-    p_v = model.prior_v(pv_ctx_flat)
-    v = p_v.sample().reshape(S, B, 1)  # (S,B,1)
-
-    # Sensor regime
-    logit = model.sensor_logit(source).squeeze(-1)  # (B,)
-    pi = torch.sigmoid(logit)
-    if shared_k:
-        k = torch.bernoulli(pi).long().unsqueeze(0).expand(S, -1)  # (S,B) shared across sensors
-    else:
-        k = torch.bernoulli(pi.unsqueeze(0).expand(S, -1)).long()  # (S,B) independent per sample
-
-    std = torch.exp(model.sensor_log_std)  # (2,)
-    sigma = std[k]  # (S,B)
-
-    eps_u = torch.randn(S, B, device=device)
-    eps_v = torch.randn(S, B, device=device)
-    xu = u.squeeze(-1) + sigma * eps_u  # (S,B)
-    xd = v.squeeze(-1) + sigma * eps_v  # (S,B)
-    return xu, xd
+    return _aggregate_metrics(df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k)
 
 
 def _aggregate_metrics(
@@ -499,17 +442,11 @@ def main() -> None:
     kind = payload["model_kind"]
 
     if kind == "gmm":
-        metrics = _compute_metrics_gmm(
-            model, df, crps_samples=args.crps_samples, energy_k=args.energy_k
-        )
+        metrics = _compute_metrics_gmm(model, df, crps_samples=args.crps_samples, energy_k=args.energy_k)
     elif kind == "markov":
-        metrics = _compute_metrics_markov(
-            model, df, crps_samples=args.crps_samples, energy_k=args.energy_k
-        )
+        metrics = _compute_metrics_markov(model, df, crps_samples=args.crps_samples, energy_k=args.energy_k)
     elif kind == "latent":
-        metrics = _compute_metrics_latent(
-            model, df, crps_samples=args.crps_samples, energy_k=args.energy_k
-        )
+        metrics = _compute_metrics_latent(model, df, crps_samples=args.crps_samples, energy_k=args.energy_k)
     else:
         raise ValueError(kind)
 
