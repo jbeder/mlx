@@ -12,6 +12,7 @@ Goal: Capture issues found while reviewing eval.py against markov_rollout_trap/R
   - Where: `_aggregate_metrics` has `energy_k=2000` default and is called from the per-kind compute functions without passing the CLI value. Then `main` re-samples a fresh rollout and re-computes the entire `rollout` block to “patch” in the requested subset size.
   - Impact: (a) Redundant compute and extra RNG draws; (b) The final `rollout` metrics come from a second rollout sample, not the one produced inside the per-kind compute; (c) harder reproducibility/debugging.
   - Fix: Thread `energy_k` from `args` down into `_compute_metrics_*` and `_aggregate_metrics`, and compute the rollout metrics exactly once using a single rollout sample; return that in the final JSON without the patch step.
+~ Status — FIXED: Threaded `energy_k` through `_compute_metrics_*` and `_aggregate_metrics` and removed the patch/recompute block from `main`. Metrics are now computed once from a single rollout sample, honoring the CLI subset size.
 
 - Latent evaluation: regime coupling is lost in per-dim MC sampling helpers
   - Where: `_latent_samples_up` and `_latent_samples_down` each sample a sensor regime `k` independently per (S,B) call. The generative model shares the same regime `k` for both sensors on a row.

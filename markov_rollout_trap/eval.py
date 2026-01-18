@@ -110,7 +110,9 @@ def _gmm_1d_log_prob(component_dist, mixture_dist, x: torch.Tensor, dim_index: i
 
 
 @torch.no_grad()
-def _compute_metrics_gmm(model: JointGaussianModel, df: pd.DataFrame, crps_samples: int = 64) -> Dict:
+def _compute_metrics_gmm(
+    model: JointGaussianModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000
+) -> Dict:
     device = next(model.parameters()).device
 
     source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
@@ -139,11 +141,15 @@ def _compute_metrics_gmm(model: JointGaussianModel, df: pd.DataFrame, crps_sampl
     up_hat = y_hat[..., 0].cpu().numpy()
     down_hat = y_hat[..., 1].cpu().numpy()
 
-    return _aggregate_metrics(df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat)
+    return _aggregate_metrics(
+        df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
+    )
 
 
 @torch.no_grad()
-def _compute_metrics_markov(model: MarkovModel, df: pd.DataFrame, crps_samples: int = 64) -> Dict:
+def _compute_metrics_markov(
+    model: MarkovModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000
+) -> Dict:
     device = next(model.parameters()).device
 
     source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
@@ -167,7 +173,9 @@ def _compute_metrics_markov(model: MarkovModel, df: pd.DataFrame, crps_samples: 
     up_hat = ro.upstream_sample.squeeze(-1).cpu().numpy()
     down_hat = ro.downstream_sample.squeeze(-1).cpu().numpy()
 
-    return _aggregate_metrics(df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat)
+    return _aggregate_metrics(
+        df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
+    )
 
 
 @torch.no_grad()
@@ -283,7 +291,9 @@ def _latent_samples_down(model: LatentModel, source: torch.Tensor, num_samples: 
 
 
 @torch.no_grad()
-def _compute_metrics_latent(model: LatentModel, df: pd.DataFrame, crps_samples: int = 64) -> Dict:
+def _compute_metrics_latent(
+    model: LatentModel, df: pd.DataFrame, crps_samples: int = 64, energy_k: int = 2000
+) -> Dict:
     device = next(model.parameters()).device
 
     source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
@@ -307,7 +317,9 @@ def _compute_metrics_latent(model: LatentModel, df: pd.DataFrame, crps_samples: 
     up_hat = ro.upstream.cpu().numpy()
     down_hat = ro.downstream.cpu().numpy()
 
-    return _aggregate_metrics(df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat)
+    return _aggregate_metrics(
+        df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
+    )
 
 
 def _aggregate_metrics(
@@ -414,77 +426,19 @@ def main() -> None:
     kind = payload["model_kind"]
 
     if kind == "gmm":
-        metrics = _compute_metrics_gmm(model, df, crps_samples=args.crps_samples)
+        metrics = _compute_metrics_gmm(
+            model, df, crps_samples=args.crps_samples, energy_k=args.energy_k
+        )
     elif kind == "markov":
-        metrics = _compute_metrics_markov(model, df, crps_samples=args.crps_samples)
+        metrics = _compute_metrics_markov(
+            model, df, crps_samples=args.crps_samples, energy_k=args.energy_k
+        )
     elif kind == "latent":
-        metrics = _compute_metrics_latent(model, df, crps_samples=args.crps_samples)
+        metrics = _compute_metrics_latent(
+            model, df, crps_samples=args.crps_samples, energy_k=args.energy_k
+        )
     else:
         raise ValueError(kind)
-
-    # Energy distance subset parameter
-    # Re-aggregate rollout metrics with chosen energy subset size if needed
-    # The per-kind compute already used default; re-run aggregation only for energy
-    # Here we recompute rollout metrics using the stored per-kind outputs would require refactor.
-    # Simpler: recompute energy here from df and last rollout samples via per-kind recomputation.
-    # To avoid additional sampling noise, we recompute metrics dict to include energy with specific k.
-    # We'll patch-in energy using aggregation util.
-    # Extract rollout samples again for energy with args.energy_k.
-    # This requires mild duplication; acceptable for clarity.
-
-    # Recompute rollout metrics portion using fresh samples for consistency with requested 2k subset
-    # Note: Other metrics remain unchanged.
-    if kind == "gmm":
-        source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
-        dist = model(source)
-        y_hat = dist.sample()
-        up_hat = y_hat[..., 0].cpu().numpy()
-        down_hat = y_hat[..., 1].cpu().numpy()
-    elif kind == "markov":
-        source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
-        ro = model.rollout(source)
-        up_hat = ro.upstream_sample.squeeze(-1).cpu().numpy()
-        down_hat = ro.downstream_sample.squeeze(-1).cpu().numpy()
-    else:  # latent
-        source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
-        ro = model.sample(source)
-        up_hat = ro.upstream.cpu().numpy()
-        down_hat = ro.downstream.cpu().numpy()
-
-    # Compute energy with requested subset
-    N = len(df)
-    m = min(N, int(args.energy_k))
-    idx = np.random.choice(N, size=m, replace=False)
-    X = np.stack([df["upstream_speed"].to_numpy()[idx], df["downstream_speed"].to_numpy()[idx]], axis=1)
-    Y = np.stack([up_hat[idx], down_hat[idx]], axis=1)
-    diff_xy = X[:, None, :] - Y[None, :, :]
-    cross = float(np.sqrt((diff_xy * diff_xy).sum(axis=-1)).mean())
-
-    # Unbiased within-set terms: exclude diagonal pairs and use mean over m*(m-1)
-    if m >= 2:
-        diff_xx = X[:, None, :] - X[None, :, :]
-        Dxx = np.sqrt((diff_xx * diff_xx).sum(axis=-1))
-        mask = ~np.eye(m, dtype=bool)
-        within_x = float(Dxx[mask].mean())
-
-        diff_yy = Y[:, None, :] - Y[None, :, :]
-        Dyy = np.sqrt((diff_yy * diff_yy).sum(axis=-1))
-        within_y = float(Dyy[mask].mean())
-    else:
-        within_x = 0.0
-        within_y = 0.0
-    joint_energy = 2.0 * cross - within_x - within_y
-
-    # Patch rollout metrics
-    obs_up = df["upstream_speed"].to_numpy()
-    obs_down = df["downstream_speed"].to_numpy()
-    metrics["rollout"] = {
-        "joint_energy": float(joint_energy),
-        "downstream_q90_err": float(abs(np.quantile(obs_down, 0.9) - np.quantile(down_hat, 0.9))),
-        "downstream_var_ratio": float(np.var(down_hat, ddof=0) / max(1e-12, np.var(obs_down, ddof=0))),
-        "downstream_mean_err": float(abs(np.mean(obs_down) - np.mean(down_hat))),
-        "upstream_var_ratio": float(np.var(up_hat, ddof=0) / max(1e-12, np.var(obs_up, ddof=0))),
-    }
 
     out_path = out_dir / "metrics.json"
     with out_path.open("w", encoding="utf-8") as f:
