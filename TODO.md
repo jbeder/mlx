@@ -28,18 +28,17 @@ Goal: Capture issues found while reviewing eval.py against markov_rollout_trap/R
 
 ## 2) Code health / duplication WTFs (don’t change behavior but raise eyebrows)
 
-- Duplicate rollout/energy computations and JSON patching
-  - `main` recomputes rollout samples and the entire `rollout` metric block after `_compute_metrics_*` already did rollout and aggregation. This is noisy and makes the control flow harder to follow.
-  - Refactor: Return rollout samples (or precomputed rollout stats) from `_compute_metrics_*`, pass `energy_k` through once, and remove the patch section in `main`.
+~ Duplicate rollout/energy computations and JSON patching — FIXED
+  - Removed the recomputation/patch block from `main`; `energy_k` is now threaded into `_compute_metrics_*` and `_aggregate_metrics`, so rollout metrics are computed once.
 
-- Two different energy-distance implementations sprinkled in two places
-  - `_aggregate_metrics` defines `pairwise_mean_norm()` and computes energy; then `main` copies the same calculus using inline broadcasting again. Centralize into one utility to avoid divergence.
+~ Two different energy-distance implementations sprinkled in two places — FIXED
+  - With the patching removed from `main`, there is now a single energy-distance implementation inside `_aggregate_metrics`, eliminating duplication.
 
-- Repeated device copies of `sensor_log_std`
-  - `_latent_log_prob_*` and `_latent_samples_*` do `model.sensor_log_std.to(device)` repeatedly. Parameters are already on the model’s device after `model.to(device)`. This is unnecessary work and slightly confusing.
+~ Repeated device copies of `sensor_log_std` — FIXED
+  - Removed redundant `.to(device)` calls; we now read `model.sensor_log_std` directly (already on the model’s device).
 
-- Inconsistent seeding helpers across train/eval
-  - `train._seed_all` seeds CUDA generators where available; `eval._seed_all` only seeds `torch.manual_seed` and `np.random.seed`. This inconsistency can create surprises when evaluating on CUDA.
+~ Inconsistent seeding helpers across train/eval — FIXED
+  - `eval._seed_all` now also seeds CUDA generators when available, mirroring train.
 
 ## 3) Minor polish (top 3 only)
 
