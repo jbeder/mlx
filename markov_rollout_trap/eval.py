@@ -98,41 +98,25 @@ def _crps_mc(samples: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return crps
 
 
-@torch.no_grad()
-def _gmm_1d_log_prob(component_dist, mixture_dist, x: torch.Tensor, dim_index: int) -> torch.Tensor:
+def _gmm_1d_log_prob(dist, x: torch.Tensor, dim_index: int) -> torch.Tensor:
     """
-    Compute 1D marginal log-prob for a mixture of multivariate normals along a given dimension.
-    Assumes component_dist is MultivariateNormal with batch shape (B, K) and event dim 2.
-    mixture_dist is Categorical with logits shape (B, K).
-
-    Args:
-      component_dist: distribution with attributes .loc (B,K,D), .covariance_matrix (B,K,D,D)
-      mixture_dist: distribution with .logits (B,K)
-      x: (B,) observed values
-      dim_index: 0 for upstream, 1 for downstream
-    Returns: (B,) log probability
+    1D marginal log-prob for a zuko/torch MixtureSameFamily whose components have event dim D.
+      dist: MixtureSameFamily (e.g., from zuko.mixtures.GMM(...)(...))
+      x: (B,)
+      dim_index: dimension to marginalize (0..D-1)
+    Returns:
+      (B,)
     """
-    logits = mixture_dist.logits  # (B,K)
-    log_w = torch.log_softmax(logits, dim=-1)  # (B,K)
+    mix = dist.mixture_distribution  # Categorical, batch (B,), events K
+    comp = dist.component_distribution  # batch (B,K), event (D)
 
-    loc = getattr(component_dist, "loc")  # (B,K,2)
-    # Prefer covariance_matrix if available
-    if hasattr(component_dist, "covariance_matrix"):
-        cov = component_dist.covariance_matrix  # (B,K,2,2)
-        var = cov[..., dim_index, dim_index]
-    elif hasattr(component_dist, "scale_tril"):
-        L = component_dist.scale_tril  # (B,K,2,2)
-        var = (L[..., dim_index, :] ** 2).sum(dim=-1)
-    else:
-        raise RuntimeError("Unsupported component distribution for GMM marginals")
+    mu = comp.loc[..., dim_index]  # (B,K)
+    std = comp.variance[..., dim_index].clamp_min(1e-12).sqrt()  # (B,K)
 
-    mu = loc[..., dim_index]  # (B,K)
-    std = (var.clamp_min(1e-12)).sqrt()
+    comp_1d = torch.distributions.Normal(mu, std)  # batch (B,K), scalar event
+    dist_1d = torch.distributions.MixtureSameFamily(mix, comp_1d)
 
-    x_ = x.unsqueeze(-1)  # (B,1)
-    lp_comp = torch.distributions.Normal(mu, std).log_prob(x_)  # (B,K)
-    lp = torch.logsumexp(log_w + lp_comp, dim=-1)  # (B,)
-    return lp
+    return dist_1d.log_prob(x)  # (B,)
 
 
 @torch.no_grad()
@@ -146,12 +130,10 @@ def _compute_metrics_gmm(
     downstream = _to_tensor(df["downstream_speed"]).to(device)
 
     dist = model(source)
-    mix = dist.mixture_distribution
-    comp = dist.component_distribution
 
     # Per-dim NLLs
-    lp_up = _gmm_1d_log_prob(comp, mix, upstream, dim_index=0)
-    lp_down = _gmm_1d_log_prob(comp, mix, downstream, dim_index=1)
+    lp_up = _gmm_1d_log_prob(dist, upstream, dim_index=0)
+    lp_down = _gmm_1d_log_prob(dist, downstream, dim_index=1)
     nll_up = (-lp_up).cpu().numpy()
     nll_down = (-lp_down).cpu().numpy()
 
