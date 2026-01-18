@@ -71,25 +71,36 @@ def _to_tensor(x: pd.Series, dtype=torch.float32) -> torch.Tensor:
 
 def _aggregate_metrics(
     df: pd.DataFrame,
+    *,
     nll_up: np.ndarray,
-    nll_down: np.ndarray,
     crps_up: np.ndarray,
-    crps_down: np.ndarray,
+    nll_up_name: str,
+    crps_up_name: str,
+    nll_down_tf: np.ndarray,
+    crps_down_tf: np.ndarray,
+    nll_down_tf_name: str,
+    crps_down_tf_name: str,
     up_hat: np.ndarray,
     down_hat: np.ndarray,
     energy_k: int = 2000,
 ) -> Dict:
-    upstream_metrics = {
+    # Teacher-forced fit metrics
+    upstream_fit = {
+        "nll_name": nll_up_name,
         "nll_mean": float(np.mean(nll_up)),
         "nll_q90": float(np.quantile(nll_up, 0.9)),
+        "crps_name": crps_up_name,
         "crps_mean": float(np.mean(crps_up)),
     }
-    downstream_metrics = {
-        "nll_mean": float(np.mean(nll_down)),
-        "nll_q90": float(np.quantile(nll_down, 0.9)),
-        "crps_mean": float(np.mean(crps_down)),
+    downstream_tf_fit = {
+        "nll_name": nll_down_tf_name,
+        "nll_mean": float(np.mean(nll_down_tf)),
+        "nll_q90": float(np.quantile(nll_down_tf, 0.9)),
+        "crps_name": crps_down_tf_name,
+        "crps_mean": float(np.mean(crps_down_tf)),
     }
 
+    # Rollout metrics (no teacher forcing)
     obs_up = df["upstream_speed"].to_numpy()
     obs_down = df["downstream_speed"].to_numpy()
 
@@ -134,8 +145,10 @@ def _aggregate_metrics(
     }
 
     return {
-        "upstream": upstream_metrics,
-        "downstream": downstream_metrics,
+        "fit": {
+            "upstream": upstream_fit,
+            "downstream_tf": downstream_tf_fit,
+        },
         "rollout": rollout_metrics,
     }
 
@@ -170,21 +183,28 @@ def main() -> None:
     downstream = _to_tensor(df["downstream_speed"]).to(device)
 
     with torch.no_grad():
-        arrays = model.eval_arrays(
+        fit = model.eval_fit_arrays(
             source,
             upstream,
             downstream,
             crps_samples=args.crps_samples,
         )
+        ro = model.eval_rollout_arrays(
+            source,
+        )
 
     metrics = _aggregate_metrics(
         df,
-        arrays.nll_up.cpu().numpy(),
-        arrays.nll_down.cpu().numpy(),
-        arrays.crps_up.cpu().numpy(),
-        arrays.crps_down.cpu().numpy(),
-        arrays.up_hat.cpu().numpy(),
-        arrays.down_hat.cpu().numpy(),
+        nll_up=fit.nll_up.cpu().numpy(),
+        crps_up=fit.crps_up.cpu().numpy(),
+        nll_up_name=getattr(fit, "nll_up_name", "nll"),
+        crps_up_name=getattr(fit, "crps_up_name", "crps"),
+        nll_down_tf=fit.nll_down_tf.cpu().numpy(),
+        crps_down_tf=fit.crps_down_tf.cpu().numpy(),
+        nll_down_tf_name=getattr(fit, "nll_down_tf_name", "nll"),
+        crps_down_tf_name=getattr(fit, "crps_down_tf_name", "crps"),
+        up_hat=ro.up_hat.cpu().numpy(),
+        down_hat=ro.down_hat.cpu().numpy(),
         energy_k=args.energy_k,
     )
 

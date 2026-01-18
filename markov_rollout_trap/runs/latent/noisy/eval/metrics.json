@@ -1,0 +1,25 @@
+{
+  "fit": {
+    "downstream_tf": {
+      "crps_mean": 3.126798391342163,
+      "crps_name": "crps_is",
+      "nll_mean": -4.616977214813232,
+      "nll_name": "nll_is",
+      "nll_q90": 3.2827706336975098
+    },
+    "upstream": {
+      "crps_mean": 54.9380989074707,
+      "crps_name": "crps_mc",
+      "nll_mean": 12.654027938842773,
+      "nll_name": "nll_mc",
+      "nll_q90": 25.655820846557617
+    }
+  },
+  "rollout": {
+    "downstream_mean_err": 104.60381909865734,
+    "downstream_q90_err": 25.696905256256315,
+    "downstream_var_ratio": 901429.2810940421,
+    "joint_energy": 114.89205540238669,
+    "upstream_var_ratio": 458.2687593852888
+  }
+}

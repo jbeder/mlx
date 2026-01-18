@@ -42,6 +42,24 @@ class EvalArrays(NamedTuple):
     down_hat: torch.Tensor  # (B,)
 
 
+class FitArrays(NamedTuple):
+    # Teacher-forced fit arrays
+    nll_up: torch.Tensor  # (B,)
+    nll_down_tf: torch.Tensor  # (B,)
+    crps_up: torch.Tensor  # (B,)
+    crps_down_tf: torch.Tensor  # (B,)
+    # Names for metric estimators (e.g., "nll", "nll_mc", "nll_is")
+    nll_up_name: str
+    nll_down_tf_name: str
+    crps_up_name: str
+    crps_down_tf_name: str
+
+
+class RolloutArrays(NamedTuple):
+    up_hat: torch.Tensor  # (B,)
+    down_hat: torch.Tensor  # (B,)
+
+
 def _crps_mc(samples: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     Monte Carlo CRPS for 1D predictive distribution.
@@ -73,16 +91,109 @@ def _gmm_1d_log_prob(dist: Distribution, x: torch.Tensor, dim_index: int) -> tor
     Returns:
       (B,)
     """
-    mix = dist.mixture_distribution  # Categorical, batch (B,), events K
-    comp = dist.component_distribution  # batch (B,K), event (D)
+    # Support torch.distributions.MixtureSameFamily and zuko.distributions.Mixture
+    if hasattr(dist, "mixture_distribution") and hasattr(dist, "component_distribution"):
+        mix = dist.mixture_distribution
+        comp = dist.component_distribution
+        # Mixture logits
+        if hasattr(mix, "logits") and mix.logits is not None:
+            logit_w = mix.logits
+        elif hasattr(mix, "probs") and mix.probs is not None:
+            logit_w = (mix.probs + 1e-12).log()
+        else:
+            raise AttributeError("Unsupported mixture: missing logits/probs")
+        mu = comp.loc[..., dim_index]  # (B,K)
+        var = comp.covariance_matrix[..., dim_index, dim_index]
+        std = var.clamp_min(1e-12).sqrt()  # (B,K)
+    elif hasattr(dist, "base") and hasattr(dist, "logits"):
+        base = dist.base  # MultivariateNormal batch (B,K), event (2)
+        logit_w = dist.logits  # (B,K)
+        mu = base.loc[..., dim_index]  # (B,K)
+        if hasattr(base, "covariance_matrix"):
+            var = base.covariance_matrix[..., dim_index, dim_index]
+        else:
+            # Fallback to scale_tril
+            L = base.scale_tril  # (...,2,2)
+            var = (L[..., dim_index, :] ** 2).sum(dim=-1)
+        std = var.clamp_min(1e-12).sqrt()
+    else:
+        raise AttributeError("Unsupported GMM distribution: missing mixture/components attributes")
 
-    mu = comp.loc[..., dim_index]  # (B,K)
-    std = comp.variance[..., dim_index].clamp_min(1e-12).sqrt()  # (B,K)
+    x_ = x.unsqueeze(-1)  # (B,1)
+    comp_lp = torch.distributions.Normal(mu, std).log_prob(x_)  # (B,K)
+    return torch.logsumexp(logit_w + comp_lp, dim=-1)  # (B,)
 
-    comp_1d = torch.distributions.Normal(mu, std)  # batch (B,K), scalar event
-    dist_1d = torch.distributions.MixtureSameFamily(mix, comp_1d)
 
-    return dist_1d.log_prob(x)  # (B,)
+def _gmm_conditional_1d(
+    dist: Distribution,
+    given_x: torch.Tensor,
+    *,
+    given_dim: int,
+    target_dim: int,
+) -> Distribution:
+    """
+    Build the conditional 1D mixture p(x_target | x_given) for a 2D full-covariance GMM.
+
+    Args:
+      dist: MixtureSameFamily with MultivariateNormal components (event dim=2)
+      given_x: (B,) observed value for the given_dim
+      given_dim: index of the dimension to condition on (0 or 1)
+      target_dim: index of the target dimension (0 or 1), target_dim != given_dim
+
+    Returns:
+      MixtureSameFamily over Normal with batch (B,) and event dim scalar representing
+      the conditional distribution.
+    """
+    # Gather parameters for both torch and zuko Mixture variants
+    if hasattr(dist, "mixture_distribution") and hasattr(dist, "component_distribution"):
+        mix = dist.mixture_distribution
+        comp = dist.component_distribution
+        if hasattr(mix, "logits") and mix.logits is not None:
+            logit_w = mix.logits
+        elif hasattr(mix, "probs") and mix.probs is not None:
+            logit_w = (mix.probs + 1e-12).log()
+        else:
+            raise AttributeError("Unsupported mixture: missing logits/probs")
+        mu = comp.loc  # (B,K,2)
+        cov = comp.covariance_matrix  # (B,K,2,2)
+    elif hasattr(dist, "base") and hasattr(dist, "logits"):
+        base = dist.base
+        logit_w = dist.logits
+        mu = base.loc
+        if hasattr(base, "covariance_matrix"):
+            cov = base.covariance_matrix
+        else:
+            L = base.scale_tril
+            cov = L @ L.transpose(-1, -2)
+    else:
+        raise AttributeError("Unsupported GMM distribution: missing mixture/base attributes")
+
+    mu_u = mu[..., given_dim]  # (B,K)
+    mu_d = mu[..., target_dim]  # (B,K)
+    S_uu = cov[..., given_dim, given_dim]  # (B,K)
+    S_dd = cov[..., target_dim, target_dim]  # (B,K)
+    S_du = cov[..., target_dim, given_dim]  # (B,K)
+    # S_ud = cov[..., given_dim, target_dim]
+
+    x = given_x.unsqueeze(-1)  # (B,1)
+    eps = 1e-8
+    inv_Suu = 1.0 / (S_uu + eps)
+
+    # Component-wise conditional parameters
+    mu_cond = mu_d + S_du * inv_Suu * (x - mu_u)  # (B,K)
+    var_cond = (S_dd - S_du * S_du * inv_Suu).clamp_min(1e-12)  # (B,K)
+    std_cond = var_cond.sqrt()
+
+    # Posterior component weights w'(k | x_given)
+    like_log = torch.distributions.Normal(mu_u, S_uu.clamp_min(1e-12).sqrt()).log_prob(
+        given_x.unsqueeze(-1)
+    )  # (B,K)
+    # Posterior over components: softmax(logits + log_like)
+    w_post = torch.softmax(logit_w + like_log, dim=-1)
+
+    comp_1d = torch.distributions.Normal(mu_cond, std_cond)  # (B,K)
+    mix_post = torch.distributions.Categorical(probs=w_post)
+    return torch.distributions.MixtureSameFamily(mix_post, comp_1d)
 
 
 class JointGaussianModel(nn.Module):
@@ -100,6 +211,53 @@ class JointGaussianModel(nn.Module):
     def forward(self, source: torch.Tensor) -> Distribution:
         ctx = self.source_emb(source)  # (B, emb_dim)
         return self.gmm(ctx)
+
+    @torch.no_grad()
+    def eval_fit_arrays(
+        self,
+        source: torch.Tensor,
+        upstream_speed: torch.Tensor,
+        downstream_speed: torch.Tensor,
+        *,
+        crps_samples: int = 64,
+    ) -> FitArrays:
+        dist = self(source)
+
+        # Upstream marginal
+        nll_up = -_gmm_1d_log_prob(dist, upstream_speed, dim_index=0)
+        samples = dist.sample((crps_samples,))  # (S,B,2)
+        up_s = samples[..., 0]  # (S,B)
+        crps_up = _crps_mc(up_s, upstream_speed)
+
+        # Downstream conditional p(xd | s, xu)
+        cond = _gmm_conditional_1d(dist, upstream_speed, given_dim=0, target_dim=1)
+        nll_down_tf = -cond.log_prob(downstream_speed)
+        down_s = cond.sample((crps_samples,))  # (S,B)
+        crps_down_tf = _crps_mc(down_s, downstream_speed)
+
+        return FitArrays(
+            nll_up=nll_up,
+            nll_down_tf=nll_down_tf,
+            crps_up=crps_up,
+            crps_down_tf=crps_down_tf,
+            nll_up_name="nll",
+            nll_down_tf_name="nll",
+            crps_up_name="crps",
+            crps_down_tf_name="crps",
+        )
+
+    @torch.no_grad()
+    def eval_rollout_arrays(
+        self,
+        source: torch.Tensor,
+        *,
+        num_samples: int = 1,
+    ) -> RolloutArrays:
+        dist = self(source)
+        y_hat = dist.sample()  # (B,2)
+        up_hat = y_hat[..., 0]
+        down_hat = y_hat[..., 1]
+        return RolloutArrays(up_hat=up_hat, down_hat=down_hat)
 
     @torch.no_grad()
     def eval_arrays(
@@ -178,6 +336,48 @@ class MarkovModel(nn.Module):
         u = upstream_speed.unsqueeze(-1)  # (B, 1)
         down_dist = self.downstream(torch.cat([ctx, u], dim=-1))
         return up_dist, down_dist
+
+    @torch.no_grad()
+    def eval_fit_arrays(
+        self,
+        source: torch.Tensor,
+        upstream_speed: torch.Tensor,
+        downstream_speed: torch.Tensor,
+        *,
+        crps_samples: int = 64,
+    ) -> FitArrays:
+        up_dist, down_dist = self(source, upstream_speed)
+
+        nll_up = -up_dist.log_prob(upstream_speed.unsqueeze(-1)).squeeze(-1)
+        nll_down_tf = -down_dist.log_prob(downstream_speed.unsqueeze(-1)).squeeze(-1)
+
+        up_s = up_dist.sample((crps_samples,)).squeeze(-1)  # (S,B)
+        down_s = down_dist.sample((crps_samples,)).squeeze(-1)
+        crps_up = _crps_mc(up_s, upstream_speed)
+        crps_down_tf = _crps_mc(down_s, downstream_speed)
+
+        return FitArrays(
+            nll_up=nll_up,
+            nll_down_tf=nll_down_tf,
+            crps_up=crps_up,
+            crps_down_tf=crps_down_tf,
+            nll_up_name="nll",
+            nll_down_tf_name="nll",
+            crps_up_name="crps",
+            crps_down_tf_name="crps",
+        )
+
+    @torch.no_grad()
+    def eval_rollout_arrays(
+        self,
+        source: torch.Tensor,
+        *,
+        num_samples: int = 1,
+    ) -> RolloutArrays:
+        ro = self.rollout(source)
+        up_hat = ro.upstream_sample.squeeze(-1)
+        down_hat = ro.downstream_sample.squeeze(-1)
+        return RolloutArrays(up_hat=up_hat, down_hat=down_hat)
 
     @torch.no_grad()
     def rollout(self, source: torch.Tensor) -> MarkovRollout:
@@ -563,6 +763,124 @@ class LatentModel(nn.Module):
         sigma = std[k]
         eps = torch.randn_like(sigma)
         return v + sigma * eps  # (S,B)
+
+    @torch.no_grad()
+    def _crps_weighted(self, samples: torch.Tensor, target: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """
+        Weighted Monte Carlo CRPS for 1D predictive distribution with normalized weights.
+
+        Args:
+          samples: (S,B)
+          target: (B,)
+          weights: (S,B) non-negative, will be normalized across S
+        Returns:
+          (B,)
+        """
+        w = weights / (weights.sum(dim=0, keepdim=True) + 1e-12)  # (S,B)
+        mean_abs = (w * (samples - target.unsqueeze(0)).abs()).sum(dim=0)  # (B,)
+        # Pairwise term: 0.5 * E_w|X - X'|
+        # Compute using broadcasting with care (S,S,B)
+        S = samples.size(0)
+        a = samples.unsqueeze(1)  # (S,1,B)
+        b = samples.unsqueeze(0)  # (1,S,B)
+        w_i = w.unsqueeze(1)  # (1,S,B) after broadcast
+        w_j = w.unsqueeze(0)  # (S,1,B) after broadcast
+        pair = (w_i * w_j * (a - b).abs()).sum(dim=(0, 1))  # (B,)
+        return mean_abs - 0.5 * pair
+
+    @torch.no_grad()
+    def _downstream_conditional_samples_is(
+        self,
+        source: torch.Tensor,
+        upstream_speed: torch.Tensor,
+        *,
+        num_samples: int = 64,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Importance sampling for p(xd | s, xu):
+          draw (u,v,k) ~ p(u|s) p(v|s,u) p(k|s),
+          weight by p(xu | u, k),
+          then draw xd ~ Normal(v, sigma_k).
+
+        Returns:
+          samples: (S,B)
+          weights: (S,B) (unnormalized)
+        """
+        ctx = self.source_emb(source)
+
+        p_u = self.prior_u(ctx)
+        u = p_u.sample((num_samples,))  # (S,B,1) or (S,B)
+        if u.dim() == 2:
+            u = u.unsqueeze(-1)
+
+        S_, B = u.shape[0], u.shape[1]
+        ctx_rep = ctx.unsqueeze(0).expand(S_, B, -1)  # (S,B,E)
+        pv_ctx = torch.cat([ctx_rep, u], dim=-1)
+        pv_ctx_flat = pv_ctx.reshape(S_ * B, -1)
+        p_v = self.prior_v(pv_ctx_flat)
+        v = p_v.sample().reshape(S_, B, 1)  # (S,B,1)
+
+        logit = self.sensor_logit(source).squeeze(-1)  # (B,)
+        pi = torch.sigmoid(logit)
+        k = torch.bernoulli(pi.unsqueeze(0).expand(S_, -1)).long()  # (S,B)
+
+        std = torch.exp(self.sensor_log_std)
+        sigma = std[k]  # (S,B)
+
+        xu = upstream_speed.unsqueeze(0).unsqueeze(-1)  # (1,B,1)
+        log_w = torch.distributions.Normal(u, sigma.unsqueeze(-1)).log_prob(xu).squeeze(-1)  # (S,B)
+        w = torch.exp(log_w - log_w.max(dim=0, keepdim=True).values)  # stabilize
+
+        xd_samples = (v.squeeze(-1) + sigma * torch.randn_like(sigma))  # (S,B)
+        return xd_samples, w
+
+    @torch.no_grad()
+    def eval_fit_arrays(
+        self,
+        source: torch.Tensor,
+        upstream_speed: torch.Tensor,
+        downstream_speed: torch.Tensor,
+        *,
+        crps_samples: int = 64,
+    ) -> FitArrays:
+        # Upstream marginal (MC)
+        lp_up = self._log_prob_up_marginal(source, upstream_speed, num_samples=crps_samples)
+        nll_up = -lp_up
+        up_s = self._samples_up_marginal(source, num_samples=crps_samples)  # (S,B)
+        crps_up = _crps_mc(up_s, upstream_speed)
+
+        # Downstream conditional (IS via joint - marginal trick)
+        lp_joint = self.log_prob(source, upstream_speed, downstream_speed, num_samples=crps_samples)
+        lp_up_m = lp_up  # reuse same S for simplicity
+        lp_down_cond = lp_joint - lp_up_m
+        nll_down_tf = -lp_down_cond
+
+        # CRPS for conditional via IS weighting
+        xd_s, w = self._downstream_conditional_samples_is(
+            source, upstream_speed, num_samples=crps_samples
+        )  # (S,B), (S,B)
+        crps_down_tf = self._crps_weighted(xd_s, downstream_speed, w)
+
+        return FitArrays(
+            nll_up=nll_up,
+            nll_down_tf=nll_down_tf,
+            crps_up=crps_up,
+            crps_down_tf=crps_down_tf,
+            nll_up_name="nll_mc",
+            nll_down_tf_name="nll_is",
+            crps_up_name="crps_mc",
+            crps_down_tf_name="crps_is",
+        )
+
+    @torch.no_grad()
+    def eval_rollout_arrays(
+        self,
+        source: torch.Tensor,
+        *,
+        num_samples: int = 1,
+    ) -> RolloutArrays:
+        ro = self.sample(source)
+        return RolloutArrays(up_hat=ro.upstream, down_hat=ro.downstream)
 
     @torch.no_grad()
     def eval_arrays(
