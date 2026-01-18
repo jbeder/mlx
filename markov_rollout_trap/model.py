@@ -185,9 +185,7 @@ def _gmm_conditional_1d(
     std_cond = var_cond.sqrt()
 
     # Posterior component weights w'(k | x_given)
-    like_log = torch.distributions.Normal(mu_u, S_uu.clamp_min(1e-12).sqrt()).log_prob(
-        given_x.unsqueeze(-1)
-    )  # (B,K)
+    like_log = torch.distributions.Normal(mu_u, S_uu.clamp_min(1e-12).sqrt()).log_prob(given_x.unsqueeze(-1))  # (B,K)
     # Posterior over components: softmax(logits + log_like)
     w_post = torch.softmax(logit_w + like_log, dim=-1)
 
@@ -831,7 +829,7 @@ class LatentModel(nn.Module):
         log_w = torch.distributions.Normal(u, sigma.unsqueeze(-1)).log_prob(xu).squeeze(-1)  # (S,B)
         w = torch.exp(log_w - log_w.max(dim=0, keepdim=True).values)  # stabilize
 
-        xd_samples = (v.squeeze(-1) + sigma * torch.randn_like(sigma))  # (S,B)
+        xd_samples = v.squeeze(-1) + sigma * torch.randn_like(sigma)  # (S,B)
         return xd_samples, w
 
     @torch.no_grad()
