@@ -133,15 +133,15 @@ Compute metrics for each `(data_mode, model_config)` pair. Report separately for
 For each of `upstream_speed` and `downstream_speed`, compute:
 
 1. **NLL mean**: average negative log-likelihood of the observed value under the model predictive distribution conditioned on `source`.
-2. **NLL q50**: median per-row NLL.
-3. **NLL q90**: 90th percentile per-row NLL.
-4. **CRPS mean**: mean Continuous Ranked Probability Score for the predictive distribution vs the observed value.
+2. **NLL q90**: 90th percentile per-row NLL.
+3. **CRPS mean**: mean Continuous Ranked Probability Score for the predictive distribution vs the observed value.
 
 Notes:
+
 - For `markov`, evaluate `upstream_speed` under `p(upstream_speed | source)` and `downstream_speed` under `p(downstream_speed | source, upstream_speed)` (teacher-forced for evaluation).
-- For `gmm`, evaluate the marginal predictive for each speed (the 1D marginal implied by the 2D Gaussian).
-- For `latent`, evaluate the marginal predictive for each observed speed (i.e., with latents integrated out; use the model’s predictive distribution as implemented).
-- CRPS may be estimated via Monte Carlo sampling from the 1D predictive distribution (e.g. S=64 per row).
+- For `gmm`, evaluate the 1D marginal implied by the 2D predictive distribution for each speed.
+- For `latent`, evaluate the predictive distribution for each observed speed (latents integrated out, approximated via sampling if needed).
+- CRPS may be estimated via Monte Carlo samples from the 1D predictive distribution (e.g. S=64 per row).
 
 ### Joint rollout sanity check
 
@@ -150,15 +150,16 @@ For each model, generate one rollout sample per row:
 
 Compute:
 
-1. **Corr error**: absolute difference between empirical correlation of `(upstream_speed, downstream_speed)` in data vs rollout samples.
-2. **Joint energy distance (rollout)**: energy distance between the 2D clouds of `(upstream_speed, downstream_speed)` from data vs `(upstream_speed_hat, downstream_speed_hat)` from rollout.
-3. **Downstream q90 error (rollout)**: absolute difference between the 90th percentile of `downstream_speed` in data vs the 90th percentile of `downstream_speed_hat` in rollout.
-4. **Downstream variance ratio (rollout)**: `Var(downstream_speed_hat) / Var(downstream_speed)`.
+1. **Joint energy distance (rollout)**: energy distance between the 2D clouds of `(upstream_speed, downstream_speed)` from data vs `(upstream_speed_hat, downstream_speed_hat)` from rollout.
+2. **Downstream q90 error (rollout)**: absolute difference between the 90th percentile of `downstream_speed` in data vs the 90th percentile of `downstream_speed_hat` in rollout.
+3. **Downstream variance ratio (rollout)**: `Var(downstream_speed_hat) / Var(downstream_speed)`.
+4. **Downstream mean error (rollout)**: absolute difference between mean `downstream_speed` in data vs mean `downstream_speed_hat` in rollout.
+5. **Upstream variance ratio (rollout)**: `Var(upstream_speed_hat) / Var(upstream_speed)`.
 
 ### Output schema
 
 Write `metrics.json` with schema:
 
-- `upstream`: `nll_mean`, `nll_q50`, `nll_q90`, `crps_mean`
-- `downstream`: `nll_mean`, `nll_q50`, `nll_q90`, `crps_mean`
-- `rollout`: `corr_err`, `joint_energy`, `downstream_q90_err`, `downstream_var_ratio`
+- `upstream`: `nll_mean`, `nll_q90`, `crps_mean`
+- `downstream`: `nll_mean`, `nll_q90`, `crps_mean`
+- `rollout`: `joint_energy`, `downstream_q90_err`, `downstream_var_ratio`, `downstream_mean_err`, `upstream_var_ratio`
