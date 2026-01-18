@@ -15,6 +15,8 @@ from .model import JointGaussianModel, LatentModel, MarkovModel
 
 def _seed_all(seed: int) -> None:
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
 
@@ -27,12 +29,36 @@ def _load_model(model_dir: Path, device: torch.device) -> Tuple[nn.Module, Dict]
     num_sources = int(payload["num_sources"])
 
     # Recreate architecture to load state_dict
+    # Prefer resolved config if present to faithfully reconstruct architecture
+    cfg_path = model_dir / "config.resolved.json"
+    cfg = None
+    if cfg_path.exists():
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
     if kind == "gmm":
+        # GMM config currently has no tunables beyond defaults; fall back to defaults
         model: nn.Module = JointGaussianModel(num_sources=num_sources)
     elif kind == "markov":
-        model = MarkovModel(num_sources=num_sources)
+        if cfg is not None:
+            emb_dim = int(cfg["model"]["markov"]["emb_dim"])  # type: ignore[index]
+            num_components = int(cfg["model"]["markov"]["num_components"])  # type: ignore[index]
+            model = MarkovModel(num_sources=num_sources, emb_dim=emb_dim, num_components=num_components)
+        else:
+            model = MarkovModel(num_sources=num_sources)
     elif kind == "latent":
-        model = LatentModel(num_sources=num_sources)
+        if cfg is not None:
+            emb_dim = int(cfg["model"]["latent"]["emb_dim"])  # type: ignore[index]
+            num_components = int(cfg["model"]["latent"]["num_components"])  # type: ignore[index]
+            encoder_hidden = int(cfg["model"]["latent"]["encoder_hidden"])  # type: ignore[index]
+            model = LatentModel(
+                num_sources=num_sources,
+                emb_dim=emb_dim,
+                num_components=num_components,
+                encoder_hidden=encoder_hidden,
+            )
+        else:
+            model = LatentModel(num_sources=num_sources)
     else:
         raise ValueError(f"Unknown model_kind: {kind}")
 
@@ -195,7 +221,7 @@ def _latent_log_prob_up(
     logit = model.sensor_logit(source).squeeze(-1)  # (B,)
     log_w0 = torch.nn.functional.logsigmoid(logit)
     log_w1 = torch.nn.functional.logsigmoid(-logit)
-    std = torch.exp(model.sensor_log_std.to(device))  # (2,)
+    std = torch.exp(model.sensor_log_std)  # (2,)
     s0, s1 = std[0], std[1]
 
     xu_ = xu.unsqueeze(0).unsqueeze(-1)  # (1,B,1)
@@ -232,7 +258,7 @@ def _latent_log_prob_down(
     logit = model.sensor_logit(source).squeeze(-1)
     log_w0 = torch.nn.functional.logsigmoid(logit)
     log_w1 = torch.nn.functional.logsigmoid(-logit)
-    std = torch.exp(model.sensor_log_std.to(device))
+    std = torch.exp(model.sensor_log_std)
     s0, s1 = std[0], std[1]
 
     xd_ = xd.unsqueeze(0).unsqueeze(-1)
@@ -256,7 +282,7 @@ def _latent_samples_up(model: LatentModel, source: torch.Tensor, num_samples: in
     logit = model.sensor_logit(source).squeeze(-1)  # (B,)
     pi = torch.sigmoid(logit)
     k = torch.bernoulli(pi.unsqueeze(0).expand(num_samples, -1)).long()  # (S,B)
-    std = torch.exp(model.sensor_log_std.to(device))  # (2,)
+    std = torch.exp(model.sensor_log_std)  # (2,)
     sigma = std[k]  # (S,B)
     eps = torch.randn_like(sigma)
     x = u.squeeze(-1) + sigma * eps  # (S,B)
@@ -283,7 +309,7 @@ def _latent_samples_down(model: LatentModel, source: torch.Tensor, num_samples: 
     logit = model.sensor_logit(source).squeeze(-1)  # (B,)
     pi = torch.sigmoid(logit)
     k = torch.bernoulli(pi.unsqueeze(0).expand(num_samples, -1)).long()  # (S,B)
-    std = torch.exp(model.sensor_log_std.to(device))
+    std = torch.exp(model.sensor_log_std)
     sigma = std[k]
     eps = torch.randn_like(sigma)
     x = v + sigma * eps  # (S,B)
@@ -320,6 +346,53 @@ def _compute_metrics_latent(
     return _aggregate_metrics(
         df, nll_up, nll_down, crps_up, crps_down, up_hat, down_hat, energy_k=energy_k
     )
+
+
+@torch.no_grad()
+def _latent_samples_joint(
+    model: LatentModel, source: torch.Tensor, num_samples: int, shared_k: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Joint sampler for (xu, xd) with optional shared sensor regime k across both sensors.
+
+    Args:
+      source: (B,)
+      num_samples: number of MC samples S
+      shared_k: if True, draws one k per row shared by upstream and downstream; if False, independent per (S,B)
+
+    Returns:
+      (xu_samples, xd_samples) each of shape (S,B)
+    """
+    device = source.device
+    ctx = model.source_emb(source)  # (B,E)
+    p_u = model.prior_u(ctx)
+    u = p_u.sample((num_samples,))  # (S,B,1) or (S,B)
+    if u.dim() == 2:
+        u = u.unsqueeze(-1)
+
+    S, B = u.shape[0], u.shape[1]
+    ctx_rep = ctx.unsqueeze(0).expand(S, B, -1)  # (S,B,E)
+    pv_ctx = torch.cat([ctx_rep, u], dim=-1)  # (S,B,E+1)
+    pv_ctx_flat = pv_ctx.reshape(S * B, -1)
+    p_v = model.prior_v(pv_ctx_flat)
+    v = p_v.sample().reshape(S, B, 1)  # (S,B,1)
+
+    # Sensor regime
+    logit = model.sensor_logit(source).squeeze(-1)  # (B,)
+    pi = torch.sigmoid(logit)
+    if shared_k:
+        k = torch.bernoulli(pi).long().unsqueeze(0).expand(S, -1)  # (S,B) shared across sensors
+    else:
+        k = torch.bernoulli(pi.unsqueeze(0).expand(S, -1)).long()  # (S,B) independent per sample
+
+    std = torch.exp(model.sensor_log_std)  # (2,)
+    sigma = std[k]  # (S,B)
+
+    eps_u = torch.randn(S, B, device=device)
+    eps_v = torch.randn(S, B, device=device)
+    xu = u.squeeze(-1) + sigma * eps_u  # (S,B)
+    xd = v.squeeze(-1) + sigma * eps_v  # (S,B)
+    return xu, xd
 
 
 def _aggregate_metrics(

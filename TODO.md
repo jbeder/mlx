@@ -18,11 +18,13 @@ Goal: Capture issues found while reviewing eval.py against markov_rollout_trap/R
   - Where: `_latent_samples_up` and `_latent_samples_down` each sample a sensor regime `k` independently per (S,B) call. The generative model shares the same regime `k` for both sensors on a row.
   - Impact: For the current usage (per-dimension CRPS only), this is acceptable; however, if these helpers were reused to construct joint metrics from CRPS samples, they would fail to capture the intended upstream/downstream coupling.
   - Fix: Provide a joint sampler that draws a single `k` per row (per sample) and reuses it for both upstream and downstream when joint samples are needed; keep per-dim samplers or share a common routine that can toggle “shared_k=True/False”.
+~ Status — FIXED: Added `_latent_samples_joint(model, source, S, shared_k=True)` that draws a single regime k per row when requested and returns joint (xu, xd) samples for potential future joint metrics.
 
 - Model architecture not faithfully reconstructed at eval time
   - Where: `_load_model` only reads `model_kind` and `num_sources` from `model.pt`, then rebuilds models with constructor defaults. Training, however, may have used different `emb_dim`, `num_components`, or `encoder_hidden` (for latent). This can cause `state_dict` shape mismatches or silently incorrect architectures if shapes happen to align.
   - Impact: Evaluations can fail or, worse, succeed with a mismatched architecture.
   - Fix: Save all necessary architecture hyperparameters in `model.pt` at train time (or load and parse `config.resolved.json`) and pass them into the model constructors in `_load_model`.
+~ Status — FIXED: `_load_model` now reads `config.resolved.json` when present and reconstructs `markov` and `latent` architectures with the saved `emb_dim`, `num_components`, and `encoder_hidden`.
 
 ## 2) Code health / duplication WTFs (don’t change behavior but raise eyebrows)
 
