@@ -57,97 +57,140 @@ def _load_model(model_dir: Path, device: torch.device) -> Tuple[nn.Module, Dict]
     return model, payload
 
 
-def _to_tensor(x: pd.Series, dtype=torch.float32) -> torch.Tensor:
-    return torch.as_tensor(x.to_numpy(), dtype=dtype)
+def _crps_mc(samples: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """
+    Monte Carlo CRPS for 1D predictive distribution.
+
+    Args:
+      samples: (S, B) array of rollout samples
+      target: (B,) array of observed values
+
+    Returns:
+      (B,) array with CRPS per row
+    """
+    S = samples.shape[0]
+    mean_abs = np.mean(np.abs(samples - target[None, :]), axis=0)  # (B,)
+
+    # Pairwise term using the equivalent sorted-sum trick to avoid O(S^2) memory
+    s_sorted = np.sort(samples, axis=0)
+    idx = np.arange(1, S + 1, dtype=s_sorted.dtype)[:, None]
+    w = 2.0 * idx - (S + 1)
+    pairwise_mean = (2.0 / (S * S)) * np.sum(w * s_sorted, axis=0)
+    crps = mean_abs - 0.5 * pairwise_mean
+    return crps
 
 
-def _aggregate_metrics(
-    df: pd.DataFrame,
-    *,
-    nll_up: np.ndarray,
-    crps_up: np.ndarray,
-    nll_up_name: str,
-    crps_up_name: str,
-    nll_down_tf: np.ndarray,
-    crps_down_tf: np.ndarray,
-    nll_down_tf_name: str,
-    crps_down_tf_name: str,
-    up_hat: np.ndarray,
-    down_hat: np.ndarray,
-    energy_k: int = 2000,
-) -> Dict:
-    # Teacher-forced fit metrics
-    upstream_fit = {
-        "nll_name": nll_up_name,
-        "nll_mean": float(np.mean(nll_up)),
-        "nll_q90": float(np.quantile(nll_up, 0.9)),
-        "crps_name": crps_up_name,
-        "crps_mean": float(np.mean(crps_up)),
-    }
-    downstream_tf_fit = {
-        "nll_name": nll_down_tf_name,
-        "nll_mean": float(np.mean(nll_down_tf)),
-        "nll_q90": float(np.quantile(nll_down_tf, 0.9)),
-        "crps_name": crps_down_tf_name,
-        "crps_mean": float(np.mean(crps_down_tf)),
-    }
+def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 2:
+        return 0.0
+    vx = x - x.mean()
+    vy = y - y.mean()
+    denom = np.sqrt((vx * vx).sum() * (vy * vy).sum())
+    if denom <= 0:
+        return 0.0
+    return float((vx * vy).sum() / denom)
 
-    # Rollout metrics (no teacher forcing)
-    # Treat rollout predictions as an S*B pool and compute metrics over all
-    # predicted samples, independent of the number of observed rows.
-    obs_up = df["upstream_speed"].to_numpy()
-    obs_down = df["downstream_speed"].to_numpy()
 
-    N = len(df)
-    M = len(up_hat)
-    mx = min(N, energy_k)
-    my = min(M, energy_k)
-    idx_x = np.random.choice(N, size=mx, replace=False)
-    idx_y = np.random.choice(M, size=my, replace=False)
-    X = np.stack([obs_up[idx_x], obs_down[idx_x]], axis=1)  # (mx,2)
-    Y = np.stack([up_hat[idx_y], down_hat[idx_y]], axis=1)  # (my,2)
+def _energy_distance_2d(obs: np.ndarray, pred: np.ndarray) -> float:
+    """Energy distance between two 2D point clouds.
 
-    def pairwise_mean_norm(a: np.ndarray, b: np.ndarray) -> float:
+    obs: (N,2), pred: (N,2) ideally same N (we'll assume same length)
+    """
+    if len(obs) == 0 or len(pred) == 0:
+        return 0.0
+
+    def pair_mean(a: np.ndarray, b: np.ndarray) -> float:
         diff = a[:, None, :] - b[None, :, :]
         d = np.sqrt((diff * diff).sum(axis=-1))
         return float(d.mean())
 
-    cross = pairwise_mean_norm(X, Y)
+    cross = pair_mean(obs, pred)
+    within_obs = 0.0
+    within_pred = 0.0
+    if obs.shape[0] >= 2:
+        Dxx = np.sqrt(((obs[:, None, :] - obs[None, :, :]) ** 2).sum(axis=-1))
+        within_obs = float(Dxx[~np.eye(obs.shape[0], dtype=bool)].mean())
+    if pred.shape[0] >= 2:
+        Dyy = np.sqrt(((pred[:, None, :] - pred[None, :, :]) ** 2).sum(axis=-1))
+        within_pred = float(Dyy[~np.eye(pred.shape[0], dtype=bool)].mean())
+    return 2.0 * cross - within_obs - within_pred
 
-    if X.shape[0] >= 2:
-        diff_xx = X[:, None, :] - X[None, :, :]
-        Dxx = np.sqrt((diff_xx * diff_xx).sum(axis=-1))
-        mask_x = ~np.eye(X.shape[0], dtype=bool)
-        within_x = float(Dxx[mask_x].mean())
 
-        diff_yy = Y[:, None, :] - Y[None, :, :]
-        Dyy = np.sqrt((diff_yy * diff_yy).sum(axis=-1))
-        mask_y = ~np.eye(Y.shape[0], dtype=bool)
-        within_y = float(Dyy[mask_y].mean()) if Y.shape[0] >= 2 else 0.0
+def _aggregate_rollout_metrics(
+    df: pd.DataFrame,
+    u_s: np.ndarray,  # (S,B)
+    d_s: np.ndarray,  # (S,B)
+    *,
+    take_first_sample: bool = True,
+) -> Dict:
+    # Observed
+    obs_up = df["upstream_speed"].to_numpy()
+    obs_down = df["downstream_speed"].to_numpy()
+    sources = df["source"].to_numpy()
+
+    # CRPS (rollout) upstream/downstream
+    crps_up = _crps_mc(u_s, obs_up).mean()
+    crps_down = _crps_mc(d_s, obs_down).mean()
+
+    # Per-source downstream mean MAE and std log-error using all rollout samples
+    # Collapse samples across S for mean/std aggregation
+    S, B = d_s.shape
+    d_flat = d_s.reshape(S * B)
+    src_rep = np.repeat(sources, S)
+
+    downstream_mean_errs = []
+    downstream_sd_logerrs = []
+    for k in np.unique(sources):
+        mask_data = sources == k
+        mask_roll = src_rep == k
+        if mask_data.sum() == 0 or mask_roll.sum() == 0:
+            continue
+        mu_data = float(obs_down[mask_data].mean())
+        mu_roll = float(d_flat[mask_roll].mean())
+        downstream_mean_errs.append(abs(mu_roll - mu_data))
+
+        sd_data = float(obs_down[mask_data].std(ddof=0))
+        sd_roll = float(d_flat[mask_roll].std(ddof=0))
+        if sd_data <= 0 or sd_roll <= 0:
+            downstream_sd_logerrs.append(0.0)
+        else:
+            downstream_sd_logerrs.append(abs(np.log(sd_roll / sd_data)))
+
+    mean_mae_by_source = float(np.mean(downstream_mean_errs)) if downstream_mean_errs else 0.0
+    sd_logerr_by_source = float(np.mean(downstream_sd_logerrs)) if downstream_sd_logerrs else 0.0
+
+    # Within-source correlation error (use one rollout sample per row to avoid overweighting rows)
+    if take_first_sample:
+        u_one = u_s[0]
+        d_one = d_s[0]
     else:
-        within_x = 0.0
-        within_y = 0.0
-    joint_energy = 2.0 * cross - within_x - within_y
+        # Random single sample per row
+        idx = np.random.randint(0, u_s.shape[0], size=u_s.shape[1])
+        u_one = u_s[idx, np.arange(u_s.shape[1])]
+        d_one = d_s[idx, np.arange(d_s.shape[1])]
 
-    down_q90_err = float(abs(np.quantile(obs_down, 0.9) - np.quantile(down_hat, 0.9)))
-    down_var_ratio = float(np.var(down_hat, ddof=0) / max(1e-12, np.var(obs_down, ddof=0)))
-    down_mean_err = float(abs(np.mean(obs_down) - np.mean(down_hat)))
-    up_var_ratio = float(np.var(up_hat, ddof=0) / max(1e-12, np.var(obs_up, ddof=0)))
+    corr_errs = []
+    for k in np.unique(sources):
+        mask = sources == k
+        if mask.sum() < 2:
+            continue
+        rho_data = _pearson_corr(obs_up[mask], obs_down[mask])
+        rho_roll = _pearson_corr(u_one[mask], d_one[mask])
+        corr_errs.append(abs(rho_roll - rho_data))
+    corr_err_by_source = float(np.mean(corr_errs)) if corr_errs else 0.0
 
-    rollout_metrics = {
-        "joint_energy": float(joint_energy),
-        "downstream_q90_err": down_q90_err,
-        "downstream_var_ratio": down_var_ratio,
-        "downstream_mean_err": down_mean_err,
-        "upstream_var_ratio": up_var_ratio,
-    }
+    # Joint energy distance (2D) using one sample per row
+    obs_pairs = np.stack([obs_up, obs_down], axis=1)  # (B,2)
+    roll_pairs = np.stack([u_one, d_one], axis=1)  # (B,2)
+    energy_2d = float(_energy_distance_2d(obs_pairs, roll_pairs))
 
     return {
-        "fit": {
-            "upstream": upstream_fit,
-            "downstream_tf": downstream_tf_fit,
-        },
-        "rollout": rollout_metrics,
+        "crps_upstream": float(crps_up),
+        "crps_downstream": float(crps_down),
+        "downstream_mean_mae_by_source": mean_mae_by_source,
+        "downstream_std_logerr_by_source": sd_logerr_by_source,
+        "corr_err_by_source": corr_err_by_source,
+        "energy_2d": energy_2d,
     }
 
 
@@ -157,19 +200,7 @@ def main() -> None:
     ap.add_argument("--model", type=str, required=True, help="Model directory containing model.pt")
     ap.add_argument("--device", type=str, default="cpu", help="Torch device for evaluation (default: cpu)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
-    ap.add_argument("--crps_samples", type=int, default=64, help="Number of MC samples for CRPS/NLL approx")
-    ap.add_argument(
-        "--energy_k",
-        type=int,
-        default=2000,
-        help="Use a random subset of this size for energy distance (default: 2000)",
-    )
-    ap.add_argument(
-        "--rollout_samples",
-        type=int,
-        default=16,
-        help="Number of rollout samples per row to draw and aggregate (default: 16)",
-    )
+    ap.add_argument("--rollout_samples", type=int, default=16, help="Number of rollout samples per row (default: 16)")
     args = ap.parse_args()
 
     _seed_all(args.seed)
@@ -183,35 +214,21 @@ def main() -> None:
     model, payload = _load_model(model_dir, device)
 
     source = torch.as_tensor(df["source"].to_numpy(), dtype=torch.long, device=device)
-    upstream = _to_tensor(df["upstream_speed"]).to(device)
-    downstream = _to_tensor(df["downstream_speed"]).to(device)
-
     with torch.no_grad():
-        fit = model.eval_fit_arrays(
-            source,
-            upstream,
-            downstream,
-            crps_samples=args.crps_samples,
-        )
-        ro = model.eval_rollout_arrays(
-            source,
-            num_samples=args.rollout_samples,
-        )
+        u_s, d_s = model.sample(source.to(device), num_samples=args.rollout_samples)
+        # Convert to numpy for metric computations
+        u_s_np = u_s.detach().cpu().numpy()
+        d_s_np = d_s.detach().cpu().numpy()
 
-    metrics = _aggregate_metrics(
-        df,
-        nll_up=fit.nll_up.cpu().numpy(),
-        crps_up=fit.crps_up.cpu().numpy(),
-        nll_up_name=getattr(fit, "nll_up_name", "nll"),
-        crps_up_name=getattr(fit, "crps_up_name", "crps"),
-        nll_down_tf=fit.nll_down_tf.cpu().numpy(),
-        crps_down_tf=fit.crps_down_tf.cpu().numpy(),
-        nll_down_tf_name=getattr(fit, "nll_down_tf_name", "nll"),
-        crps_down_tf_name=getattr(fit, "crps_down_tf_name", "crps"),
-        up_hat=ro.up_hat.cpu().numpy(),
-        down_hat=ro.down_hat.cpu().numpy(),
-        energy_k=args.energy_k,
-    )
+    rollout_metrics = _aggregate_rollout_metrics(df, u_s_np, d_s_np)
+
+    metrics = {
+        "meta": {
+            "num_samples": int(args.rollout_samples),
+            "num_rows": int(len(df)),
+        },
+        "rollout": rollout_metrics,
+    }
 
     out_path = out_dir / "metrics.json"
     with out_path.open("w", encoding="utf-8") as f:

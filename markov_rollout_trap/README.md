@@ -24,7 +24,7 @@ In mode=clean:
 
 - Generate source (uniform random in 0..K-1)
 - Generate upstream_speed ~ Normal(mu, sigma^2) from that source
-- Generate downstream_speed by applying a drag of v/(1+c*v) to upstream_speed (using that source’s c), then adding Normal(0, process_sigma^2)
+- Generate downstream_speed by applying a drag of v/(1+c\*v) to upstream_speed (using that source’s c), then adding Normal(0, process_sigma^2)
 
 In mode=noisy
 
@@ -32,7 +32,7 @@ In mode=noisy
 - Sample z ~ Bernoulli(0.5) and set sensor_sigma as above
 - Generate a latent upstream speed ~ Normal(mu, sigma^2) from that source
 - Generate upstream_speed by adding noise ~ Normal(0, sensor_sigma^2) to the latent upstream speed
-- Generate a latent downstream speed by applying a drag of v/(1+c*v) on the latent upstream speed (using that source’s c), then adding Normal(0, process_sigma^2)
+- Generate a latent downstream speed by applying a drag of v/(1+c\*v) on the latent upstream speed (using that source’s c), then adding Normal(0, process_sigma^2)
 - Generate downstream_speed by adding noise ~ Normal(0, sensor_sigma^2) to the latent downstream speed
 
 ## Model
@@ -104,7 +104,6 @@ What it models:
   - `p(u | source)` as a 1D diagonal Gaussian
   - `p(v | source, u)` as a 1D diagonal Gaussian
 - Two sensor likelihoods that map latent true values to observed readings, as a shared 2-component Gaussian mixture (same component selection for upstream and downstream on a given row):
-
   - `p(upstream_speed | u)` = π(source) Normal(u, sensor_sigma0^2) + (1-π(source)) Normal(u, sensor_sigma1^2)
   - `p(downstream_speed | v)` = π(source) Normal(v, sensor_sigma0^2) + (1-π(source)) Normal(v, sensor_sigma1^2)
 
@@ -126,40 +125,59 @@ Rollout:
 
 python -m markov_rollout_trap.eval --data=<filename.parquet> --model=<model_dir>
 
-Compute metrics for each `(data_mode, model_config)` pair. Report separately for `upstream_speed` and `downstream_speed`. Writes a new file /eval/metrics.json to the model directory.
+Compute metrics for each `(data_mode, model_config)` pair. **All primary metrics must be computed from rollouts**, i.e. samples produced by `sample(source)` (no conditioning on observed `upstream_speed`). Writes `/eval/metrics.json` to the model directory.
 
-### Per-speed distributional fit
+### Rollout sampling protocol
 
-For each of `upstream_speed` and `downstream_speed`, compute:
+For each row `i` with `source_i`, draw `S` rollout samples:
 
-1. **NLL mean**: average negative log-likelihood of the observed value under the model predictive distribution conditioned on `source`.
-2. **NLL q90**: 90th percentile per-row NLL.
-3. **CRPS mean**: mean Continuous Ranked Probability Score for the predictive distribution vs the observed value.
+- `(u_hat[i,s], d_hat[i,s]) ~ sample(source_i)` for `s = 1..S`
 
-Notes:
+All metrics below use only:
 
-- For `markov`, evaluate `upstream_speed` under `p(upstream_speed | source)` and `downstream_speed` under `p(downstream_speed | source, upstream_speed)` (teacher-forced for evaluation).
-- For `gmm`, evaluate the 1D marginal implied by the 2D predictive distribution for each speed.
-- For `latent`, evaluate the predictive distribution for each observed speed (latents integrated out, approximated via sampling if needed).
-- CRPS may be estimated via Monte Carlo samples from the 1D predictive distribution (e.g. S=64 per row).
+- observed `(upstream_speed_i, downstream_speed_i)`
+- rollout samples `(u_hat[i,*], d_hat[i,*])`
 
-### Joint rollout sanity check
+### Primary rollout metrics
 
-For each model, generate one rollout sample per row:
-- `sample(source)` -> `(upstream_speed_hat, downstream_speed_hat)`
+1. **Upstream CRPS (rollout)**
+   Mean CRPS of `upstream_speed_i` against samples `{u_hat[i,*]}`.
 
-Compute:
+2. **Downstream CRPS (rollout)** _(the headline)_
+   Mean CRPS of `downstream_speed_i` against samples `{d_hat[i,*]}`.
 
-1. **Joint energy distance (rollout)**: energy distance between the 2D clouds of `(upstream_speed, downstream_speed)` from data vs `(upstream_speed_hat, downstream_speed_hat)` from rollout.
-2. **Downstream q90 error (rollout)**: absolute difference between the 90th percentile of `downstream_speed` in data vs the 90th percentile of `downstream_speed_hat` in rollout.
-3. **Downstream variance ratio (rollout)**: `Var(downstream_speed_hat) / Var(downstream_speed)`.
-4. **Downstream mean error (rollout)**: absolute difference between mean `downstream_speed` in data vs mean `downstream_speed_hat` in rollout.
-5. **Upstream variance ratio (rollout)**: `Var(upstream_speed_hat) / Var(upstream_speed)`.
+3. **Per-source downstream mean MAE (rollout)**
+   For each source `k`:
+   - `mu_data[k] = mean(downstream_speed | source=k)`
+   - `mu_roll[k] = mean(d_hat | source=k)` using all rollout samples for rows with `source=k`
+     Report `mean_k |mu_roll[k] - mu_data[k]|`.
+
+4. **Per-source downstream std log-error (rollout)**
+   For each source `k`:
+   - `sd_data[k] = std(downstream_speed | source=k)`
+   - `sd_roll[k] = std(d_hat | source=k)` (over all rollout samples)
+     Report `mean_k |log(sd_roll[k] / sd_data[k])|`.
+
+5. **Within-source correlation error (rollout)**
+   For each source `k`, compute Pearson correlation:
+   - `rho_data[k] = corr(upstream_speed, downstream_speed | source=k)`
+   - `rho_roll[k] = corr(u_hat, d_hat | source=k)` (use one rollout sample per row, e.g. `s=1`, to avoid overweighting rows)
+     Report `mean_k |rho_roll[k] - rho_data[k]|`.
+
+6. **Joint energy distance (rollout, 2D)**
+   Energy distance between the empirical 2D clouds of observed pairs `(upstream_speed, downstream_speed)` and rollout pairs `(u_hat, d_hat)` (use one rollout sample per row so the clouds have matching size).
 
 ### Output schema
 
-Write `metrics.json` with schema:
+Write `metrics.json` as:
 
-- `upstream`: `nll_mean`, `nll_q90`, `crps_mean`
-- `downstream`: `nll_mean`, `nll_q90`, `crps_mean`
-- `rollout`: `joint_energy`, `downstream_q90_err`, `downstream_var_ratio`, `downstream_mean_err`, `upstream_var_ratio`
+- `meta`:
+  - `num_samples`
+  - `num_rows`
+- `rollout`:
+  - `crps_upstream`
+  - `crps_downstream`
+  - `downstream_mean_mae_by_source`
+  - `downstream_std_logerr_by_source`
+  - `corr_err_by_source`
+  - `energy_2d`
