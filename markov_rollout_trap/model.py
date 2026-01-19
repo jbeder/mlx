@@ -99,7 +99,11 @@ def _gmm_1d_log_prob(dist: Distribution, x: torch.Tensor, dim_index: int) -> tor
 
     x_ = x.unsqueeze(-1)  # (B,1)
     comp_lp = torch.distributions.Normal(mu, std).log_prob(x_)  # (B,K)
-    return torch.logsumexp(logit_w + comp_lp, dim=-1)  # (B,)
+    # Mixture normalization: logits are unnormalized; p(x) = sum_k softmax(logits)_k * N(x; mu_k, std_k)
+    # log p(x) = logsumexp(logits + log N_k(x)) - logsumexp(logits)
+    log_num = torch.logsumexp(logit_w + comp_lp, dim=-1)  # (B,)
+    log_den = torch.logsumexp(logit_w, dim=-1)  # (B,)
+    return log_num - log_den  # (B,)
 
 
 def _gmm_conditional_1d(
@@ -869,11 +873,21 @@ class LatentModel(nn.Module):
         )
         nll_down_tf = -lp_down_cond
 
-        # CRPS for conditional via IS weighting
+        # CRPS for conditional: harmonize estimator with other models by using
+        # unweighted MC samples drawn via importance resampling.
+        # Draw proposal samples and IS weights, then resample indices per row.
         xd_s, w = self._downstream_conditional_samples_is(
             source, upstream_speed, num_samples=crps_samples
         )  # (S,B), (S,B)
-        crps_down_tf = self._crps_weighted(xd_s, downstream_speed, w)
+        # Normalize weights per row (across S)
+        w_norm = w / (w.sum(dim=0, keepdim=True) + 1e-12)  # (S,B)
+        # Multinomial resampling per row: sample S indices for each batch element
+        # torch.multinomial operates row-wise for 2D inputs shaped (B,S)
+        idx_bt = torch.multinomial(w_norm.transpose(0, 1), num_samples=xd_s.size(0), replacement=True)  # (B,S)
+        idx = idx_bt.transpose(0, 1)  # (S,B)
+        # Gather along sample dimension
+        xd_resampled = xd_s.gather(dim=0, index=idx)  # (S,B)
+        crps_down_tf = _crps_mc(xd_resampled, downstream_speed)
 
         return FitArrays(
             nll_up=nll_up,
@@ -883,7 +897,7 @@ class LatentModel(nn.Module):
             nll_up_name="nll_mc",
             nll_down_tf_name="nll_is",
             crps_up_name="crps_mc",
-            crps_down_tf_name="crps_is",
+            crps_down_tf_name="crps",
         )
 
     @torch.no_grad()
