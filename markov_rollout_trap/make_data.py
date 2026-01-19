@@ -40,13 +40,21 @@ def generate_data(mode: str, seed: int, sources: int, count: int):
         downstream_obs = downstream_latent + np.random.normal(0.0, sensor_sigma)
     else:
         raise ValueError("mode must be 'clean' or 'noisy'")
+    
+    # normalize both upstream and downstream
+    upstream_mean = upstream_obs.mean()
+    upstream_std = upstream_obs.std()
+    downstream_mean = downstream_obs.mean()
+    downstream_std = downstream_obs.std()
+    upstream_z = (upstream_obs - upstream_mean) / upstream_std
+    downstream_z = (downstream_obs - downstream_mean) / downstream_std
 
     df = pd.DataFrame(
         {
             "id": ids,
             "source": src.astype(np.int32),
-            "upstream_speed": upstream_obs.astype(np.float64),
-            "downstream_speed": downstream_obs.astype(np.float64),
+            "upstream_speed": upstream_z.astype(np.float64),
+            "downstream_speed": downstream_z.astype(np.float64),
         }
     )
     return df
