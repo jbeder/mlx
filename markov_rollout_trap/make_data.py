@@ -21,6 +21,8 @@ def generate_data(mode: str, seed: int, sources: int, count: int):
     s = 0.3
     cs = np.exp(np.random.normal(np.log(c0), s, size=sources))
     process_sigma = 0.3
+    # Per-source mixture weight pi_k ~ Uniform(0.1, 0.9)
+    pis = np.random.uniform(0.1, 0.9, size=sources)
 
     # Rows
     src = np.random.randint(0, sources, size=count)
@@ -32,15 +34,27 @@ def generate_data(mode: str, seed: int, sources: int, count: int):
         upstream_obs = upstream_latent
         downstream_obs = downstream_latent
     elif mode == "noisy":
-        z = (np.random.rand(count) < 0.5).astype(np.int32)
-        sensor_sigma = np.where(z == 0, 0.3, 1.2)
+        # Per-row regime shared across upstream/downstream, with per-source mixture weight
+        pi_row = pis[src]
+        z = (np.random.rand(count) < pi_row).astype(np.int32)  # 1=bad regime, 0=good regime
+
+        # Bad regime is genuinely biased and higher-variance (bimodal: +/- B with 50/50)
+        B = 2.0
+        sign = np.where(np.random.rand(count) < 0.5, 1.0, -1.0)
+        bias = np.where(z == 1, sign * B, 0.0)
+
+        sigma0 = 0.3
+        sigma1 = 1.2
+        sensor_sigma = np.where(z == 0, sigma0, sigma1)
+
         upstream_latent = np.random.normal(mus[src], sigmas[src])
-        upstream_obs = upstream_latent + np.random.normal(0.0, sensor_sigma)
         downstream_latent = drag(upstream_latent, cs[src]) + np.random.normal(0.0, process_sigma, size=count)
-        downstream_obs = downstream_latent + np.random.normal(0.0, sensor_sigma)
+
+        upstream_obs = upstream_latent + bias + np.random.normal(0.0, sensor_sigma)
+        downstream_obs = downstream_latent + bias + np.random.normal(0.0, sensor_sigma)
     else:
         raise ValueError("mode must be 'clean' or 'noisy'")
-    
+
     # normalize both upstream and downstream
     upstream_mean = upstream_obs.mean()
     upstream_std = upstream_obs.std()
@@ -55,6 +69,8 @@ def generate_data(mode: str, seed: int, sources: int, count: int):
             "source": src.astype(np.int32),
             "upstream_speed": upstream_z.astype(np.float64),
             "downstream_speed": downstream_z.astype(np.float64),
+            # Not for training; keep for analysis.
+            "sensor_pi": pis[src].astype(np.float64),
         }
     )
     return df
