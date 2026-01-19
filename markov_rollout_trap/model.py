@@ -792,6 +792,63 @@ class LatentModel(nn.Module):
         return xd_samples, w
 
     @torch.no_grad()
+    def _log_prob_down_conditional_is(
+        self,
+        source: torch.Tensor,
+        upstream_speed: torch.Tensor,
+        downstream_speed: torch.Tensor,
+        *,
+        num_samples: int = 64,
+    ) -> torch.Tensor:
+        """
+        Self-normalized importance sampling estimate of log p(xd | s, xu).
+
+        Proposal: q(u, v, k) = p(u|s) p(v|s,u) p(k|s)
+        Weights:  w(u,v,k)  p(xu | u, k)
+
+        log p(xd | s, xu) H logsumexp_s [ log w_s + log p(xd | v_s, k_s) ]
+                               - logsumexp_s [ log w_s ]
+
+        Shapes:
+          returns (B,)
+        """
+        ctx = self.source_emb(source)
+
+        # Sample from proposal
+        p_u = self.prior_u(ctx)
+        u = p_u.sample((num_samples,))  # (S,B,1) or (S,B)
+        if u.dim() == 2:
+            u = u.unsqueeze(-1)
+
+        S_, B = u.shape[0], u.shape[1]
+        ctx_rep = ctx.unsqueeze(0).expand(S_, B, -1)  # (S,B,E)
+        pv_ctx = torch.cat([ctx_rep, u], dim=-1)
+        pv_ctx_flat = pv_ctx.reshape(S_ * B, -1)
+        p_v = self.prior_v(pv_ctx_flat)
+        v = p_v.sample().reshape(S_, B, 1)  # (S,B,1)
+
+        logit = self.sensor_logit(source).squeeze(-1)  # (B,)
+        pi = torch.sigmoid(logit)
+        k = torch.bernoulli(pi.unsqueeze(0).expand(S_, -1)).long()  # (S,B)
+
+        std = torch.exp(self.sensor_log_std)
+        sigma = std[k]  # (S,B)
+
+        xu = upstream_speed.unsqueeze(0).unsqueeze(-1)  # (1,B,1)
+        xd = downstream_speed.unsqueeze(0).unsqueeze(-1)  # (1,B,1)
+
+        # Unnormalized log-weights from upstream likelihood
+        log_w = torch.distributions.Normal(u, sigma.unsqueeze(-1)).log_prob(xu).squeeze(-1)  # (S,B)
+
+        # Likelihood terms for downstream
+        log_px = torch.distributions.Normal(v, sigma.unsqueeze(-1)).log_prob(xd).squeeze(-1)  # (S,B)
+
+        # Stable log-sum-exp computations across S
+        log_num = torch.logsumexp(log_w + log_px, dim=0)  # (B,)
+        log_den = torch.logsumexp(log_w, dim=0)  # (B,)
+        return log_num - log_den  # (B,)
+
+    @torch.no_grad()
     def eval_fit_arrays(
         self,
         source: torch.Tensor,
@@ -800,16 +857,16 @@ class LatentModel(nn.Module):
         *,
         crps_samples: int = 64,
     ) -> FitArrays:
-        # Upstream marginal (MC)
+        # Upstream marginal (MC over prior + sensor mixture)
         lp_up = self._log_prob_up_marginal(source, upstream_speed, num_samples=crps_samples)
         nll_up = -lp_up
         up_s = self._samples_up_marginal(source, num_samples=crps_samples)  # (S,B)
         crps_up = _crps_mc(up_s, upstream_speed)
 
-        # Downstream conditional (IS via joint - marginal trick)
-        lp_joint = self.log_prob(source, upstream_speed, downstream_speed, num_samples=crps_samples)
-        lp_up_m = lp_up  # reuse same S for simplicity
-        lp_down_cond = lp_joint - lp_up_m
+        # Downstream conditional (self-normalized IS)
+        lp_down_cond = self._log_prob_down_conditional_is(
+            source, upstream_speed, downstream_speed, num_samples=crps_samples
+        )
         nll_down_tf = -lp_down_cond
 
         # CRPS for conditional via IS weighting
