@@ -1,14 +1,14 @@
 {
   "meta": {
     "num_rows": 10000,
-    "num_samples": 16
+    "num_samples": 128
   },
   "rollout": {
-    "corr_err_by_source": 0.0009074638124772272,
-    "crps_downstream": 0.20689553905699276,
-    "crps_upstream": 0.41669107560778884,
-    "downstream_mean_mae_by_source": 0.7506976096204074,
-    "downstream_std_logerr_by_source": 1.075636005154599,
-    "energy_2d": -0.00021995992192480607
+    "corr_err_by_source": 0.0011642160180997617,
+    "crps_downstream": 0.19600148174776058,
+    "crps_upstream": 0.39535666728176316,
+    "downstream_mean_mae_by_source": 0.7522365713736565,
+    "downstream_std_logerr_by_source": 1.076249097589173,
+    "energy_2d": -0.00022247136225206354
   }
 }

@@ -36,7 +36,7 @@ for MODE in clean noisy; do
       --data "$DATA_DIR/${MODE}.parquet" \
       --model "$(dirname "$0")/runs/${MODEL}/${MODE}" \
       --seed "$SEED" \
-      --rollout_samples 16
+      --rollout_samples 128
   done
 done
 
