@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
 
+from .config import AppConfig, decode_config
 from .model import JointGaussianModel, LatentModel, MarkovModel
 
 
@@ -29,25 +30,26 @@ def _load_model(model_dir: Path, device: torch.device) -> Tuple[nn.Module, Dict]
     num_sources = int(payload["num_sources"])
 
     cfg_path = model_dir / "config.resolved.json"
-    cfg = None
+    cfg: Optional[AppConfig] = None
     if cfg_path.exists():
         with cfg_path.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
+            raw = json.load(f)
+        cfg = decode_config(AppConfig, raw)
 
     if kind == "gmm":
         model: nn.Module = JointGaussianModel(num_sources=num_sources)
     elif kind == "markov":
         if cfg is not None:
-            emb_dim = int(cfg["model"]["markov"]["emb_dim"])  # type: ignore[index]
-            num_components = int(cfg["model"]["markov"]["num_components"])  # type: ignore[index]
+            emb_dim = int(cfg.model.markov.emb_dim)
+            num_components = int(cfg.model.markov.num_components)
             model = MarkovModel(num_sources=num_sources, emb_dim=emb_dim, num_components=num_components)
         else:
             model = MarkovModel(num_sources=num_sources)
     elif kind == "latent":
         if cfg is not None:
-            emb_dim = int(cfg["model"]["latent"]["emb_dim"])  # type: ignore[index]
-            num_components = int(cfg["model"]["latent"]["num_components"])  # type: ignore[index]
-            encoder_hidden = int(cfg["model"]["latent"]["encoder_hidden"])  # type: ignore[index]
+            emb_dim = int(cfg.model.latent.emb_dim)
+            num_components = int(cfg.model.latent.num_components)
+            encoder_hidden = int(cfg.model.latent.encoder_hidden)
             model = LatentModel(
                 num_sources=num_sources,
                 emb_dim=emb_dim,

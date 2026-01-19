@@ -13,9 +13,19 @@ class ConfigError(ValueError):
 
 
 def load_config(path: str, cls: Type[T]) -> T:
+    """
+    Load config from a YAML file into the typed dataclass ``cls``.
+    """
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-    return decode_dataclass(cls, raw, path="config")
+    return decode_config(cls, raw)
+
+
+def decode_config(cls: Type[T], data: Mapping[str, Any]) -> T:
+    """
+    Decode a Python mapping into the typed dataclass ``cls``.
+    """
+    return decode_dataclass(cls, data, path="config")
 
 
 def decode_dataclass(cls: Type[T], data: Any, *, path: str) -> T:
