@@ -99,3 +99,31 @@ Actionable follow-ups (if we want latent to improve and per-source fidelity to m
 - Strengthen u→v dependence learning in latent (e.g., richer conditional head or more components for p(v|s,u); consider a less factorized encoder, or KL annealing, to better capture the dependency).
 - Encourage per-source calibration during training (e.g., add auxiliary per-source calibration losses measured on validation batches; or increase capacity of source embeddings / mixture components so models don’t collapse to pooled behavior).
 - Keep rollout-only metrics (as done here) and consider adding explicit per-source calibration diagnostics to training logs to prevent regressions.
+
+---
+
+Postscript: Are gmm/markov “too good,” or is latent “not good enough” on noisy?
+
+Question
+
+- Goal reminder: demonstrate that gmm/markov cannot match a latent model on the noisy dataset.
+- Observation from noisy metrics (S=128, N=10k):
+  - gmm: crps_down=0.2525, corr_err=0.0089, energy_2d≈-2.06e-4
+  - markov: crps_down=0.2526, corr_err=0.0101, energy_2d≈-2.52e-4
+  - latent: crps_down=0.3389, corr_err=0.2661, energy_2d≈0.0806
+
+Answer (based on code and metrics):
+
+- The issue is primarily that the latent model is not good enough on the noisy dataset, not that gmm/markov are “too good.”
+  - Code confirms the generator change (per-source π and biased bad regime) and latent implements it correctly (shared k, learned ±B, global sigmas). There is no evidence of evaluation bias favoring gmm/markov: eval.py computes rollout-only metrics uniformly across models.
+  - gmm/markov performing well on pooled metrics is plausible: source-conditioned GMMs with 2 components can approximate the global mixture in normalized space, keeping pooled energy/CRPS small. Their within-source correlation errors are also small, indicating they capture the upstream→downstream coupling better than latent under current training.
+  - Latent’s weaknesses are specific: very large within-source correlation error and higher energy distance. This points to an underutilized p(v|s,u): the learned conditional doesn’t couple v tightly to u, despite correct sensor-regime modeling. The encoder is factorized (q(u) q(v)), which can make learning a strong dependency harder.
+
+Implication for the demonstration
+
+- To make the intended point (latent > gmm/markov on noisy), we should focus on improving the latent model rather than weakening gmm/markov further. Concretely:
+  1) Strengthen p(v|s,u) capacity (more components or a richer conditional head) and consider a less-factorized encoder (e.g., joint q(u,v) or coupling via shared layers), possibly with KL annealing to encourage informative posteriors.
+  2) Add training diagnostics/auxiliary losses that reflect the rollout metrics, especially within-source correlation (e.g., minimize |corr_roll[k] − corr_data[k]| on a validation split) and per-source calibration (mean/std) to prevent collapse to pooled behavior.
+  3) If necessary, increase S in training/eval for latent (more samples in ELBO/IS) and report effective sample sizes to rule out estimator variance as a culprit.
+
+Net: The current evidence says latent underperforms relative to its capacity, so the path to the demo is improving latent’s conditional/process learning rather than assuming gmm/markov are artificially advantaged.
