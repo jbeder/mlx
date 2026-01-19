@@ -7,8 +7,8 @@ CFG="$(dirname "$0")/config.yaml"
 
 mkdir -p "$DATA_DIR"
 
-echo "==> Generating data (clean & noisy)"
 for MODE in clean noisy; do
+  echo "[data] mode=${MODE}"
   python -m markov_rollout_trap.make_data \
     --mode "$MODE" \
     --seed "$SEED" \
@@ -16,9 +16,10 @@ for MODE in clean noisy; do
     --count 10000 \
     --out "$DATA_DIR/${MODE}.parquet"
 done
-echo "==> Training runs (3 models x 2 datasets)"
+
 for MODE in clean noisy; do
   for MODEL in gmm markov latent; do
+    echo "[train] model=${MODEL} mode=${MODE}"
     python -m markov_rollout_trap.train \
       --config "$CFG" \
       --model "$MODEL" \
@@ -27,9 +28,10 @@ for MODE in clean noisy; do
       --out_dir "$(dirname "$0")/runs/${MODEL}/${MODE}"
   done
 done
-echo "==> Evaluations (each run on its matching dataset)"
+
 for MODE in clean noisy; do
   for MODEL in gmm markov latent; do
+    echo "[eval] model=${MODEL} mode=${MODE}"
     python -m markov_rollout_trap.eval \
       --data "$DATA_DIR/${MODE}.parquet" \
       --model "$(dirname "$0")/runs/${MODEL}/${MODE}" \
