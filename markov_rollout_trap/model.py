@@ -186,14 +186,20 @@ class LatentRollout(NamedTuple):
 
 class LatentModel(nn.Module):
     """
-    Latent true speeds + shared sensor-noise regime.
+    Latent true speeds + shared sensor-noise regime with per-source mixture weight
+    and biased bad-sensor component.
 
     Generative:
       u ~ p(u | source)
       v ~ p(v | source, u)
       k ~ Bernoulli(pi(source))   # shared for both sensors on the row
-      upstream_speed   ~ Normal(u, sigma_k^2)
-      downstream_speed ~ Normal(v, sigma_k^2)
+      If k=0 (good):
+        upstream_speed   ~ Normal(u + 0,      sigma0^2)
+        downstream_speed ~ Normal(v + 0,      sigma0^2)
+      If k=1 (bad, biased & high-variance):
+        b ~ {+B, -B} with 50/50
+        upstream_speed   ~ Normal(u + b,      sigma1^2)
+        downstream_speed ~ Normal(v + b,      sigma1^2)
 
     Training:
       ELBO with factorized Gaussian encoder q(u|s,xu,xd) q(v|s,xu,xd).
@@ -238,8 +244,10 @@ class LatentModel(nn.Module):
         # Sensor mixture parameters:
         #   pi(source) via an embedding -> logit
         #   sigma0, sigma1 are global learned scalars (log-stds)
+        #   B (bias magnitude for bad regime) learned as positive via softplus
         self.sensor_logit = nn.Embedding(num_sources, 1)
         self.sensor_log_std = nn.Parameter(torch.zeros(2))  # (2,) for k in {0,1}
+        self._bias_mag_raw = nn.Parameter(torch.tensor(2.0))  # initialize near generator's B
 
     def _encode(self, source: torch.Tensor, upstream_speed: torch.Tensor, downstream_speed: torch.Tensor):
         ctx = self.source_emb(source)  # (B, emb_dim)
@@ -267,10 +275,14 @@ class LatentModel(nn.Module):
         downstream_speed: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         # shared k for upstream + downstream:
-        # log sum_k [ w_k(source) * N(xu; u, s_k^2) * N(xd; v, s_k^2) ]
+        # log sum_k [ w_k(source) * p(xu, xd | k) ]
+        # with:
+        #   k=0: xu ~ N(u + 0,  sigma0^2), xd ~ N(v + 0,  sigma0^2)
+        #   k=1: b in {+B, -B} 50/50, xu ~ N(u + b, sigma1^2), xd ~ N(v + b, sigma1^2)
         logit = self.sensor_logit(source).squeeze(-1)  # (B,)
-        log_w0 = torch.nn.functional.logsigmoid(logit)  # log pi
-        log_w1 = torch.nn.functional.logsigmoid(-logit)  # log (1-pi)
+        # Define pi = P(k=1 is bad). Then k=0 has weight (1-pi).
+        log_w1 = torch.nn.functional.logsigmoid(logit)  # log pi (bad)
+        log_w0 = torch.nn.functional.logsigmoid(-logit)  # log (1-pi) (good)
 
         xu = upstream_speed.unsqueeze(-1)  # (B,1)
         xd = downstream_speed.unsqueeze(-1)  # (B,1)
@@ -278,16 +290,28 @@ class LatentModel(nn.Module):
         log_std = self.sensor_log_std  # (2,)
         std0 = torch.exp(log_std[0])
         std1 = torch.exp(log_std[1])
+        Bmag = torch.nn.functional.softplus(self._bias_mag_raw) + 1e-6
 
-        lp0 = torch.distributions.Normal(u, std0).log_prob(xu) + torch.distributions.Normal(v, std0).log_prob(
-            xd
-        )  # (B,1)
-        lp1 = torch.distributions.Normal(u, std1).log_prob(xu) + torch.distributions.Normal(v, std1).log_prob(
-            xd
-        )  # (B,1)
+        # k = 0 (good): zero bias
+        lp0 = torch.distributions.Normal(u + 0.0, std0).log_prob(xu) + torch.distributions.Normal(
+            v + 0.0, std0
+        ).log_prob(xd)  # (B,1)
 
-        lp0 = lp0.squeeze(-1) + log_w0
-        lp1 = lp1.squeeze(-1) + log_w1
+        # k = 1 (bad): mixture over +/- B with equal weights
+        lp1_plus = torch.distributions.Normal(u + Bmag, std1).log_prob(xu) + torch.distributions.Normal(
+            v + Bmag, std1
+        ).log_prob(xd)  # (B,1)
+        lp1_minus = torch.distributions.Normal(u - Bmag, std1).log_prob(xu) + torch.distributions.Normal(
+            v - Bmag, std1
+        ).log_prob(xd)  # (B,1)
+        lp1_mix = torch.logsumexp(
+            torch.stack([lp1_plus, lp1_minus], dim=-1).squeeze(-2)  # (B,2)
+            + torch.log(torch.tensor(0.5, device=u.device)),
+            dim=-1,
+        )  # (B,)
+
+        lp0 = lp0.squeeze(-1) + log_w0  # (B,)
+        lp1 = lp1_mix + log_w1  # (B,)
 
         return torch.logsumexp(torch.stack([lp0, lp1], dim=-1), dim=-1)  # (B,)
 
@@ -407,9 +431,14 @@ class LatentModel(nn.Module):
         std = torch.exp(self.sensor_log_std)  # (2,)
         sigma = std[k]  # (S,B)
 
+        # Bias magnitude for bad regime, with 50/50 sign
+        Bmag = torch.nn.functional.softplus(self._bias_mag_raw) + 1e-6
+        sign = torch.where(torch.rand_like(sigma) < 0.5, 1.0, -1.0)
+        bias = torch.where(k == 1, sign * Bmag, torch.zeros_like(sigma))  # (S,B)
+
         eps_up = torch.randn_like(sigma)
         eps_down = torch.randn_like(sigma)
-        up_s = u_s.squeeze(-1) + sigma * eps_up  # (S,B)
-        down_s = v_s.squeeze(-1) + sigma * eps_down  # (S,B)
+        up_s = u_s.squeeze(-1) + bias + sigma * eps_up  # (S,B)
+        down_s = v_s.squeeze(-1) + bias + sigma * eps_down  # (S,B)
 
         return up_s, down_s
