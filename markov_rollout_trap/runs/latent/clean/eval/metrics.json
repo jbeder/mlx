@@ -4,11 +4,11 @@
     "num_samples": 128
   },
   "rollout": {
-    "corr_err_by_source": 0.9845331759190884,
-    "crps_downstream": 0.2193924108343292,
-    "crps_upstream": 0.39521517727234434,
-    "downstream_mean_mae_by_source": 0.7508477355365233,
-    "downstream_std_logerr_by_source": 1.190780004041973,
-    "energy_2d": 0.015685453227444635
+    "corr_err_by_source": 0.3937241382172254,
+    "crps_downstream": 0.3028741194604825,
+    "crps_upstream": 0.435652372085939,
+    "downstream_mean_mae_by_source": 0.7508192344016938,
+    "downstream_std_logerr_by_source": 1.562299384829516,
+    "energy_2d": 0.09252186659267725
   }
 }
