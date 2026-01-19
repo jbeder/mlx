@@ -16,10 +16,10 @@
     }
   },
   "rollout": {
-    "downstream_mean_err": 0.011803971603512499,
-    "downstream_q90_err": 0.018073069979665624,
-    "downstream_var_ratio": 0.9919975399971008,
-    "joint_energy": -0.001326352036468803,
-    "upstream_var_ratio": 1.015000343322754
+    "downstream_mean_err": 0.009863513521849844,
+    "downstream_q90_err": 0.022011148859975682,
+    "downstream_var_ratio": 0.9963420033454895,
+    "joint_energy": -0.0003439572631405152,
+    "upstream_var_ratio": 1.0072458982467651
   }
 }
