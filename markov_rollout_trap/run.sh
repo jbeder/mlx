@@ -14,7 +14,7 @@ for MODE in clean noisy; do
     --seed "$SEED" \
     --sources 10 \
     --count 10000 \
-    --out "$DATA_DIR/${MODE}.parquet"
+    --data_dir "$DATA_DIR"
 done
 
 for MODE in clean noisy; do
@@ -24,7 +24,8 @@ for MODE in clean noisy; do
       --config "$CFG" \
       --model "$MODEL" \
       --seed "$SEED" \
-      --data "$DATA_DIR/${MODE}.parquet" \
+      --data_dir "$DATA_DIR" \
+      --mode "$MODE" \
       --out_dir "$(dirname "$0")/runs/${MODEL}/${MODE}"
   done
 done
@@ -33,7 +34,8 @@ for MODE in clean noisy; do
   for MODEL in gmm markov latent; do
     echo "[eval] model=${MODEL} mode=${MODE}"
     python -m markov_rollout_trap.eval \
-      --data "$DATA_DIR/${MODE}.parquet" \
+      --data_dir "$DATA_DIR" \
+      --mode "$MODE" \
       --model "$(dirname "$0")/runs/${MODEL}/${MODE}" \
       --seed "$SEED" \
       --rollout_samples 128

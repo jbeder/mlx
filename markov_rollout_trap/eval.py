@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import os
 from typing import Dict, Tuple
 
 import numpy as np
@@ -196,7 +197,11 @@ def _aggregate_rollout_metrics(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, required=True, help="Input parquet file path")
+    # Data location: allow either explicit --data or (--data_dir + --mode)
+    default_data_dir = os.path.join(os.path.dirname(__file__), "data")
+    ap.add_argument("--data", type=str, default=None, help="Input parquet file path (overrides --data_dir/--mode)")
+    ap.add_argument("--data_dir", type=str, default=default_data_dir, help=f"Directory containing parquet data (default: {default_data_dir})")
+    ap.add_argument("--mode", type=str, choices=["clean", "noisy"], default="clean", help="Dataset variant when using --data_dir (default: clean)")
     ap.add_argument("--model", type=str, required=True, help="Model directory containing model.pt")
     ap.add_argument("--device", type=str, default="cpu", help="Torch device for evaluation (default: cpu)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
@@ -206,7 +211,8 @@ def main() -> None:
     _seed_all(args.seed)
     device = torch.device(args.device)
 
-    df = pd.read_parquet(args.data)
+    data_path = args.data or os.path.join(args.data_dir, f"{args.mode}.parquet")
+    df = pd.read_parquet(data_path)
     model_dir = Path(args.model)
     out_dir = model_dir / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)

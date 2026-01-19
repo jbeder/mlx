@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import os
 from typing import TypeVar
 
 import pandas as pd
@@ -60,7 +61,11 @@ def main() -> None:
     ap.add_argument("--model", type=str, required=True, choices=["gmm", "markov", "latent"], help="Model kind")
     ap.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     ap.add_argument("--device", type=str, default="auto", help="torch device, e.g. cpu|cuda|auto (default: auto)")
-    ap.add_argument("--data", type=str, required=True, help="Input parquet file path")
+    # Data location: allow either explicit --data or (--data_dir + --mode)
+    default_data_dir = os.path.join(os.path.dirname(__file__), "data")
+    ap.add_argument("--data", type=str, default=None, help="Input parquet file path (overrides --data_dir/--mode)")
+    ap.add_argument("--data_dir", type=str, default=default_data_dir, help=f"Directory containing parquet data (default: {default_data_dir})")
+    ap.add_argument("--mode", type=str, choices=["clean", "noisy"], default="clean", help="Dataset variant when using --data_dir (default: clean)")
     ap.add_argument("--out_dir", type=str, required=True, help="Output directory for model + metrics")
     args = ap.parse_args()
 
@@ -72,7 +77,8 @@ def main() -> None:
     _seed_all(args.seed)
     device = _get_device(args.device)
 
-    df = pd.read_parquet(args.data)
+    data_path = args.data or os.path.join(args.data_dir, f"{args.mode}.parquet")
+    df = pd.read_parquet(data_path)
     num_sources = _infer_num_sources(df)
 
     ds: Dataset = SpeedDataset(df)
@@ -139,7 +145,7 @@ def main() -> None:
         "model_kind": args.model,
         "seed": args.seed,
         "device": str(device),
-        "data": args.data,
+        "data": data_path,
         "out_dir": str(out_dir),
         "num_sources": num_sources,
         "state_dict": model.state_dict(),

@@ -66,11 +66,20 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sources", type=int, default=10)
     p.add_argument("--count", type=int, default=10000)
-    p.add_argument("--out", required=True, help="Output parquet filename")
+    # New: allow a data directory to be provided; default to package data dir
+    default_data_dir = os.path.join(os.path.dirname(__file__), "data")
+    p.add_argument(
+        "--data_dir",
+        type=str,
+        default=default_data_dir,
+        help=f"Directory to write parquet to when --out is not provided (default: {default_data_dir})",
+    )
+    # Make --out optional; if not provided, we write to <data_dir>/<mode>.parquet
+    p.add_argument("--out", type=str, default=None, help="Output parquet filename (overrides --data_dir)")
     args = p.parse_args()
 
     df = generate_data(args.mode, args.seed, args.sources, args.count)
-    out_path = args.out
+    out_path = args.out or os.path.join(args.data_dir, f"{args.mode}.parquet")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"Wrote {out_path} with {len(df)} rows.")
