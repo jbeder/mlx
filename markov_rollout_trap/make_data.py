@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import os
 
@@ -54,32 +53,6 @@ def generate_data(mode: str, seed: int, sources: int, count: int):
     return df
 
 
-def to_parquet(df, out_path: str):
-    # Try PyArrow first
-    try:
-        import pyarrow as pa  # noqa: F401
-        import pyarrow.parquet as pq  # noqa: F401
-
-        df.to_parquet(out_path, index=False)
-        return
-    except Exception as e:
-        # Try via duckdb CLI if available
-        try:
-            import shutil
-
-            if shutil.which("duckdb") is not None:
-                tmp_csv = out_path + ".tmp.csv"
-                df.to_csv(tmp_csv, index=False)
-                os.system(
-                    f"duckdb -c \"COPY (SELECT * FROM read_csv_auto('{tmp_csv}')) TO '{out_path}' (FORMAT PARQUET)\""
-                )
-                os.remove(tmp_csv)
-                return
-        except Exception:
-            pass
-        raise RuntimeError("Failed to write parquet. Install pyarrow or duckdb CLI. Original error: %r" % (e,))
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["clean", "noisy"], default="clean")
@@ -92,7 +65,7 @@ def main():
     df = generate_data(args.mode, args.seed, args.sources, args.count)
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    to_parquet(df, out_path)
+    df.to_parquet(out_path, index=False)
     print(f"Wrote {out_path} with {len(df)} rows.")
 
 
