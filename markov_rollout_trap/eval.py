@@ -93,14 +93,19 @@ def _aggregate_metrics(
     }
 
     # Rollout metrics (no teacher forcing)
+    # Treat rollout predictions as an S*B pool and compute metrics over all
+    # predicted samples, independent of the number of observed rows.
     obs_up = df["upstream_speed"].to_numpy()
     obs_down = df["downstream_speed"].to_numpy()
 
     N = len(df)
-    m = min(N, energy_k)
-    idx = np.random.choice(N, size=m, replace=False)
-    X = np.stack([obs_up[idx], obs_down[idx]], axis=1)  # (m,2)
-    Y = np.stack([up_hat[idx], down_hat[idx]], axis=1)
+    M = len(up_hat)
+    mx = min(N, energy_k)
+    my = min(M, energy_k)
+    idx_x = np.random.choice(N, size=mx, replace=False)
+    idx_y = np.random.choice(M, size=my, replace=False)
+    X = np.stack([obs_up[idx_x], obs_down[idx_x]], axis=1)  # (mx,2)
+    Y = np.stack([up_hat[idx_y], down_hat[idx_y]], axis=1)  # (my,2)
 
     def pairwise_mean_norm(a: np.ndarray, b: np.ndarray) -> float:
         diff = a[:, None, :] - b[None, :, :]
@@ -109,15 +114,16 @@ def _aggregate_metrics(
 
     cross = pairwise_mean_norm(X, Y)
 
-    if m >= 2:
+    if X.shape[0] >= 2:
         diff_xx = X[:, None, :] - X[None, :, :]
         Dxx = np.sqrt((diff_xx * diff_xx).sum(axis=-1))
-        mask = ~np.eye(m, dtype=bool)
-        within_x = float(Dxx[mask].mean())
+        mask_x = ~np.eye(X.shape[0], dtype=bool)
+        within_x = float(Dxx[mask_x].mean())
 
         diff_yy = Y[:, None, :] - Y[None, :, :]
         Dyy = np.sqrt((diff_yy * diff_yy).sum(axis=-1))
-        within_y = float(Dyy[mask].mean())
+        mask_y = ~np.eye(Y.shape[0], dtype=bool)
+        within_y = float(Dyy[mask_y].mean()) if Y.shape[0] >= 2 else 0.0
     else:
         within_x = 0.0
         within_y = 0.0
@@ -158,6 +164,12 @@ def main() -> None:
         default=2000,
         help="Use a random subset of this size for energy distance (default: 2000)",
     )
+    ap.add_argument(
+        "--rollout_samples",
+        type=int,
+        default=16,
+        help="Number of rollout samples per row to draw and aggregate (default: 16)",
+    )
     args = ap.parse_args()
 
     _seed_all(args.seed)
@@ -183,6 +195,7 @@ def main() -> None:
         )
         ro = model.eval_rollout_arrays(
             source,
+            num_samples=args.rollout_samples,
         )
 
     metrics = _aggregate_metrics(

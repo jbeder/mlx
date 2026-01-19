@@ -56,8 +56,10 @@ class FitArrays(NamedTuple):
 
 
 class RolloutArrays(NamedTuple):
-    up_hat: torch.Tensor  # (B,)
-    down_hat: torch.Tensor  # (B,)
+    # For rollout we may return multiple samples per row; implementations below
+    # flatten (S,B) to (S*B,) so downstream eval can treat them as a single pool.
+    up_hat: torch.Tensor  # (S*B,)
+    down_hat: torch.Tensor  # (S*B,)
 
 
 def _crps_mc(samples: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -212,12 +214,14 @@ class JointGaussianModel(nn.Module):
         self,
         source: torch.Tensor,
         *,
-        num_samples: int = 1,
+        num_samples: int = 16,
     ) -> RolloutArrays:
         dist = self(source)
-        y_hat = dist.sample()  # (B,2)
-        up_hat = y_hat[..., 0]
-        down_hat = y_hat[..., 1]
+        # Draw S samples and flatten to a single pool of predictions
+        y_s = dist.sample((num_samples,))  # (S,B,2)
+        y_flat = y_s.reshape(-1, 2)  # (S*B,2)
+        up_hat = y_flat[:, 0]
+        down_hat = y_flat[:, 1]
         return RolloutArrays(up_hat=up_hat, down_hat=down_hat)
 
     @torch.no_grad()
@@ -333,11 +337,32 @@ class MarkovModel(nn.Module):
         self,
         source: torch.Tensor,
         *,
-        num_samples: int = 1,
+        num_samples: int = 16,
     ) -> RolloutArrays:
-        ro = self.rollout(source)
-        up_hat = ro.upstream_sample.squeeze(-1)
-        down_hat = ro.downstream_sample.squeeze(-1)
+        # Vectorized rollout with S samples per row, then flatten to (S*B,)
+        ctx = self.source_emb(source)  # (B,E)
+
+        # Upstream draws
+        up_dist = self.upstream(ctx)
+        u_s = up_dist.sample((num_samples,))  # (S,B,1) or (S,B)
+        if u_s.dim() == 2:
+            u_s = u_s.unsqueeze(-1)
+
+        # Downstream draws conditioned on sampled upstream
+        S, B = u_s.shape[0], u_s.shape[1]
+        ctx_rep = ctx.unsqueeze(0).expand(S, B, -1)  # (S,B,E)
+        down_ctx = torch.cat([ctx_rep, u_s], dim=-1)  # (S,B,E+1)
+        down_ctx_flat = down_ctx.reshape(S * B, -1)  # (S*B,E+1)
+        down_dist = self.downstream(down_ctx_flat)  # batch (S*B,1)
+        d_flat = down_dist.sample()  # (S*B,1) or (S*B,)
+        if d_flat.dim() == 1:
+            d_flat = d_flat.unsqueeze(-1)
+
+        # Flatten upstream as well
+        u_flat = u_s.reshape(S * B, 1)
+
+        up_hat = u_flat.squeeze(-1)
+        down_hat = d_flat.squeeze(-1)
         return RolloutArrays(up_hat=up_hat, down_hat=down_hat)
 
     @torch.no_grad()
@@ -905,10 +930,44 @@ class LatentModel(nn.Module):
         self,
         source: torch.Tensor,
         *,
-        num_samples: int = 1,
+        num_samples: int = 16,
     ) -> RolloutArrays:
-        ro = self.sample(source)
-        return RolloutArrays(up_hat=ro.upstream, down_hat=ro.downstream)
+        # Vectorized rollout with shared sensor regime per sample for both sensors
+        ctx = self.source_emb(source)  # (B,E)
+
+        # Sample u ~ p(u|s) for S draws
+        p_u = self.prior_u(ctx)
+        u_s = p_u.sample((num_samples,))  # (S,B,1) or (S,B)
+        if u_s.dim() == 2:
+            u_s = u_s.unsqueeze(-1)
+
+        # Sample v ~ p(v|s,u)
+        S, B = u_s.shape[0], u_s.shape[1]
+        ctx_rep = ctx.unsqueeze(0).expand(S, B, -1)  # (S,B,E)
+        pv_ctx = torch.cat([ctx_rep, u_s], dim=-1)  # (S,B,E+1)
+        pv_ctx_flat = pv_ctx.reshape(S * B, -1)
+        p_v = self.prior_v(pv_ctx_flat)
+        v_flat = p_v.sample()  # (S*B,1) or (S*B,)
+        if v_flat.dim() == 1:
+            v_flat = v_flat.unsqueeze(-1)
+        v_s = v_flat.reshape(S, B, 1)
+
+        # Shared sensor regime per (sample, row)
+        logit = self.sensor_logit(source).squeeze(-1)  # (B,)
+        pi = torch.sigmoid(logit)
+        k = torch.bernoulli(pi.unsqueeze(0).expand(S, -1)).long()  # (S,B)
+
+        std = torch.exp(self.sensor_log_std)  # (2,)
+        sigma = std[k]  # (S,B)
+
+        eps_up = torch.randn_like(sigma)
+        eps_down = torch.randn_like(sigma)
+        up_s = u_s.squeeze(-1) + sigma * eps_up  # (S,B)
+        down_s = v_s.squeeze(-1) + sigma * eps_down  # (S,B)
+
+        up_hat = up_s.reshape(S * B)
+        down_hat = down_s.reshape(S * B)
+        return RolloutArrays(up_hat=up_hat, down_hat=down_hat)
 
     @torch.no_grad()
     def eval_arrays(

@@ -35,7 +35,8 @@ for MODE in clean noisy; do
     python -m markov_rollout_trap.eval \
       --data "$DATA_DIR/${MODE}.parquet" \
       --model "$(dirname "$0")/runs/${MODEL}/${MODE}" \
-      --seed "$SEED"
+      --seed "$SEED" \
+      --rollout_samples 16
   done
 done
 
