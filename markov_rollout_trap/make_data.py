@@ -3,7 +3,7 @@ import argparse
 import os
 
 import numpy as np
-from duckdb import torch
+import torch
 
 
 def drag(v: np.ndarray, c: float) -> np.ndarray:
