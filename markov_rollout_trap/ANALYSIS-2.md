@@ -15,14 +15,14 @@ Key code changes verified
     - downstream_z = (downstream_obs - downstream_mean) / downstream_std
   - Effect: All models train/eval on standardized units (per-variable, dataset-level normalization).
 
-- GMM marginal NLL bug fixed: _gmm_1d_log_prob now includes mixture normalization.
-  - Code: model.py::_gmm_1d_log_prob
+- GMM marginal NLL bug fixed: \_gmm_1d_log_prob now includes mixture normalization.
+  - Code: model.py::\_gmm_1d_log_prob
     - Uses logsumexp(logits + log N) − logsumexp(logits)
   - This corrects the optimistic NLL seen earlier.
 
 - Estimator harmonization for latent downstream CRPS: now uses standard MC CRPS via importance resampling.
   - Code: model.py::LatentModel.eval_fit_arrays
-    - _downstream_conditional_samples_is(...) + multinomial resampling → _crps_mc(...)
+    - \_downstream_conditional_samples_is(...) + multinomial resampling → \_crps_mc(...)
     - Downstream NLL still via self-normalized IS (nll_is), but CRPS is harmonized.
 
 - Sampling parameterization: all sampling paths use std (sigma), not variance.
@@ -62,7 +62,7 @@ Numbers below are from the current JSONs; units are z-score space.
     - Downstream_tf (is): nll_mean 0.628, crps_mean 0.241
     - Rollout: upstream_var_ratio 0.979, downstream_var_ratio 1.228, joint_energy ≈ 0.0117
 
-1) How did the models do?
+1. How did the models do?
 
 - Per-speed fits (teacher-forced)
   - Upstream: All three models are very similar in normalized space (nll_mean ≈ 1.05–1.09, crps ≈ 0.397–0.410). No material separation.
@@ -74,7 +74,7 @@ Numbers below are from the current JSONs; units are z-score space.
 
 Bottom line: On normalized data, gmm and markov provide the best downstream teacher-forced fits and the best rollouts. Latent underperforms downstream (wider predictive) and rolls out with slightly inflated downstream variance.
 
-2) How did we expect the models to do?
+2. How did we expect the models to do?
 
 From README and prior reasoning:
 
@@ -84,16 +84,16 @@ From README and prior reasoning:
 - Noisy
   - Expect latent to gain an advantage by modeling shared two-regime sensor noise and separating process vs measurement; gmm/markov should degrade relative to clean.
 
-3) What might cause the discrepancies?
+3. What might cause the discrepancies?
 
 Discrepancy A: Latent is worse than gmm/markov on downstream (both clean and noisy), contrary to expectation.
 
 - Code-confirmed mechanics
   - markov/gmm condition directly on the observed upstream_speed during both training and teacher-forced evaluation.
-    - Code: model.py::MarkovModel.forward/eval_fit_arrays and JointGaussianModel conditional via _gmm_conditional_1d
+    - Code: model.py::MarkovModel.forward/eval_fit_arrays and JointGaussianModel conditional via \_gmm_conditional_1d
   - latent’s downstream teacher-forced likelihood integrates out latents via a proposal p(u|s)p(v|s,u) and reweights by p(xu|u,k). This is a principled estimator but not as sharp a conditional as a direct parameterization may achieve, especially with finite samples.
-    - Code: model.py::LatentModel._log_prob_down_conditional_is (self-normalized IS)
-    - CRPS is computed from resampled IS draws: LatentModel.eval_fit_arrays → _downstream_conditional_samples_is + _crps_mc
+    - Code: model.py::LatentModel.\_log_prob_down_conditional_is (self-normalized IS)
+    - CRPS is computed from resampled IS draws: LatentModel.eval_fit_arrays → \_downstream_conditional_samples_is + \_crps_mc
 
 - Likely cause (grounded in code structure)
   - Direct conditional modeling (markov/gmm) can produce a tighter p(downstream | source, upstream_obs) than latent’s IS-based approximate conditional over (u,v,k). Even with correct estimation, latent places uncertainty on both u and v plus the shared sensor regime, which naturally yields broader conditionals than a model that maps upstream_obs → downstream directly.
@@ -104,7 +104,7 @@ Discrepancy B: Earlier runs (ANALYSIS.md / ANALYSIS-1.md) showed catastrophic ro
 
 - Code and data changes explain the reversal:
   - Input normalization now z-scores both variables per dataset (make_data.py). Working in normalized space stabilizes scale and eliminates earlier scale-mismatch artifacts.
-  - GMM marginal NLL formula is corrected (model.py::_gmm_1d_log_prob), removing the optimistic NLL bias and aligning fit metrics with observed rollouts.
+  - GMM marginal NLL formula is corrected (model.py::\_gmm_1d_log_prob), removing the optimistic NLL bias and aligning fit metrics with observed rollouts.
   - Estimator harmonization for latent’s downstream CRPS removes apples-to-oranges comparisons seen previously.
   - Sampling throughout uses std correctly (no std-vs-var bug found in current code paths).
 
@@ -127,7 +127,7 @@ Answers to the three questions
 Actionable next checks (if pursuing latent gains)
 
 - Consider per-source sensor sigmas (instead of global), or richer conditioning of sensor parameters on source; this is closer to the data generation where noise regime probability depends on source and regime, and might sharpen conditionals.
-- Increase IS sample size and report effective sample size for latent downstream metrics to rule out estimator variance as a contributor.
+- Increase IS sample size and report effective sample size for latent downstream metrics to rule out estimator variance as a contributor. [DONE]
 - Explore conditioning p(v | source, u) with higher capacity or more mixture components to better capture the downstream mapping in normalized space.
 
 References
