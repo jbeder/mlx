@@ -35,6 +35,7 @@ def decode_dataclass(cls: Type[T], data: Any, *, path: str) -> T:
         raise ConfigError(f"{path} must be a mapping, got {type(data).__name__}")
 
     data_map = dict(data)
+
     out_kwargs: Dict[str, Any] = {}
 
     allowed = {f.name for f in fields(cls)}
@@ -171,9 +172,14 @@ class MarkovModelConfig:
 @dataclass(frozen=True)
 class LatentModelConfig:
     emb_dim: int
-    num_components: int
-    encoder_hidden: int
-    elbo_samples: int
+    num_components_u: int = 2
+    num_components_v: int = 2
+    encoder_hidden: int = 64
+    pv_ctx_hidden: int = 64
+    elbo_samples: int = 1
+    kl_anneal_steps: int = 0
+    kl_beta_start: float = 1.0
+    kl_beta_end: float = 1.0
 
 
 @dataclass(frozen=True)

@@ -101,18 +101,20 @@ Latents:
 What it models:
 
 - A process model on latents:
-  - `p(u | source)` as a 1D diagonal Gaussian
-  - `p(v | source, u)` as a 1D diagonal Gaussian
-- Two sensor likelihoods that map latent true values to observed readings, as a shared 2-component Gaussian mixture (same component selection for upstream and downstream on a given row):
-  - `p(upstream_speed | u)` = π(source) Normal(u, sensor_sigma0^2) + (1-π(source)) Normal(u, sensor_sigma1^2)
-  - `p(downstream_speed | v)` = π(source) Normal(v, sensor_sigma0^2) + (1-π(source)) Normal(v, sensor_sigma1^2)
+  - `p(u | source)` as a 1D diagonal Gaussian mixture with K_u components
+  - `p(v | source, u)` as a 1D diagonal Gaussian mixture with K_v components, using a richer conditional head that takes `[embedding(source), u]` through an MLP
+- Two sensor likelihoods that map latent true values to observed readings, as a shared 2-regime mixture with per-source mixing weight and biased bad regime:
+  - `k ~ Bernoulli(π(source))` (shared for both sensors)
+  - if `k=0` (good): `Normal(u, σ0^2)` and `Normal(v, σ0^2)`
+  - if `k=1` (bad): add a shared bias `b ∈ {+B, -B}` 50/50, then `Normal(u+b, σ1^2)` and `Normal(v+b, σ1^2)`
 
 Training:
 
 - Latent-variable maximum likelihood via variational inference (ELBO):
-  - introduce an encoder / approximate posterior `q(u, v | source, upstream_speed, downstream_speed)`
+  - introduce an encoder / approximate posterior `q(u, v | source, upstream_speed, downstream_speed)` as a joint 2D Gaussian with full covariance
   - optimize generative params and encoder params jointly
-- Sensor mixture parameters are learned (two sigmas sensor_sigma0, sensor_sigma1, plus a mixing logit for π; conditioned on source).
+  - KL annealing during training: scale the KL term by a schedule β ∈ [β_start, β_end]
+- Sensor mixture parameters are learned (two sigmas σ0, σ1; per-source mixing logit π; and positive bias magnitude B).
 
 Rollout:
 

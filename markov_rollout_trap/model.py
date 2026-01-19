@@ -209,8 +209,10 @@ class LatentModel(nn.Module):
         self,
         num_sources: int,
         emb_dim: int = 8,
-        num_components: int = 2,
+        num_components_u: int = 2,
+        num_components_v: int = 4,
         encoder_hidden: int = 64,
+        pv_ctx_hidden: int = 64,
     ):
         super().__init__()
         self.source_emb = nn.Embedding(num_sources, emb_dim)
@@ -219,26 +221,34 @@ class LatentModel(nn.Module):
         self.prior_u = GMM(
             features=1,
             context=emb_dim,
-            components=num_components,
+            components=num_components_u,
             covariance_type="diagonal",
             epsilon=1e-6,
         )
+        # Richer conditional head for p(v|s,u): MLP-transformed context and more components
+        self.pv_ctx = nn.Sequential(
+            nn.Linear(emb_dim + 1, pv_ctx_hidden),
+            nn.SiLU(),
+            nn.Linear(pv_ctx_hidden, pv_ctx_hidden),
+            nn.SiLU(),
+        )
         self.prior_v = GMM(
             features=1,
-            context=emb_dim + 1,
-            components=num_components,
+            context=pv_ctx_hidden,
+            components=num_components_v,
             covariance_type="diagonal",
             epsilon=1e-6,
         )
 
         # Encoder q(u, v | source, upstream_speed, downstream_speed)
-        # Outputs: mu_u, log_std_u, mu_v, log_std_v
+        # Joint 2D Gaussian with full covariance (less-factorized encoder)
+        # Outputs: [mu_u, mu_v, log_std_u, log_std_v, rho_raw]
         self.encoder = nn.Sequential(
             nn.Linear(emb_dim + 2, encoder_hidden),
             nn.SiLU(),
             nn.Linear(encoder_hidden, encoder_hidden),
             nn.SiLU(),
-            nn.Linear(encoder_hidden, 4),
+            nn.Linear(encoder_hidden, 5),
         )
 
         # Sensor mixture parameters:
@@ -256,15 +266,28 @@ class LatentModel(nn.Module):
         xd = downstream_speed.unsqueeze(-1)  # (B, 1)
         h = torch.cat([ctx, xu, xd], dim=-1)  # (B, emb_dim+2)
 
-        params = self.encoder(h)  # (B, 4)
-        mu_u, log_std_u, mu_v, log_std_v = params.chunk(4, dim=-1)
+        params = self.encoder(h)  # (B, 5)
+        mu_u, mu_v, log_std_u, log_std_v, rho_raw = params.split(1, dim=-1)
 
+        # Positive stds
         std_u = torch.nn.functional.softplus(log_std_u) + 1e-4
         std_v = torch.nn.functional.softplus(log_std_v) + 1e-4
+        # Correlation in (-1,1)
+        rho = torch.tanh(rho_raw) * 0.999
 
-        q_u = torch.distributions.Normal(mu_u, std_u)  # event dim 1
-        q_v = torch.distributions.Normal(mu_v, std_v)  # event dim 1
-        return ctx, q_u, q_v
+        # Build covariance matrix for 2D Gaussian
+        cov_uu = std_u.square().squeeze(-1)  # (B,)
+        cov_vv = std_v.square().squeeze(-1)  # (B,)
+        cov_uv = rho.squeeze(-1) * std_u.squeeze(-1) * std_v.squeeze(-1)  # (B,)
+        cov = torch.zeros((h.size(0), 2, 2), device=h.device, dtype=h.dtype)
+        cov[:, 0, 0] = cov_uu
+        cov[:, 1, 1] = cov_vv
+        cov[:, 0, 1] = cov_uv
+        cov[:, 1, 0] = cov_uv
+
+        loc = torch.cat([mu_u, mu_v], dim=-1).squeeze(-1)  # (B,2)
+        q_uv = torch.distributions.MultivariateNormal(loc=loc, covariance_matrix=cov)
+        return ctx, q_uv
 
     def _sensor_joint_log_prob(
         self,
@@ -316,10 +339,10 @@ class LatentModel(nn.Module):
         return torch.logsumexp(torch.stack([lp0, lp1], dim=-1), dim=-1)  # (B,)
 
     def forward(self, source: torch.Tensor, upstream_speed: torch.Tensor, downstream_speed: torch.Tensor):
-        ctx, q_u, q_v = self._encode(source, upstream_speed, downstream_speed)
+        ctx, q_uv = self._encode(source, upstream_speed, downstream_speed)
 
         p_u = self.prior_u(ctx)  # p(u|source)
-        return ctx, p_u, q_u, q_v
+        return ctx, p_u, q_uv
 
     def elbo(
         self,
@@ -328,36 +351,51 @@ class LatentModel(nn.Module):
         downstream_speed: torch.Tensor,
         num_samples: int = 1,
     ) -> torch.Tensor:
-        ctx, q_u, q_v = self._encode(source, upstream_speed, downstream_speed)
+        # Keep for compatibility: returns mean ELBO
+        mean_log_p, mean_log_q, mean_log_px = self.elbo_terms(
+            source, upstream_speed, downstream_speed, num_samples=num_samples
+        )
+        elbo = mean_log_p + mean_log_px - mean_log_q
+        return elbo
+
+    def elbo_terms(
+        self,
+        source: torch.Tensor,
+        upstream_speed: torch.Tensor,
+        downstream_speed: torch.Tensor,
+        num_samples: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return batch-mean Monte Carlo estimates of E_q[log p(u)+log p(v|u)], E_q[log q(u,v)], E_q[log p(x|u,v)]."""
+        ctx, q_uv = self._encode(source, upstream_speed, downstream_speed)
 
         p_u = self.prior_u(ctx)
+
         log_p_terms = []
         log_q_terms = []
         log_px_terms = []
 
         for _ in range(num_samples):
-            u = q_u.rsample()  # (B,1)
-            v = q_v.rsample()  # (B,1)
+            z = q_uv.rsample()  # (B,2)
+            u = z[:, 0:1]
+            v = z[:, 1:2]
 
-            p_v = self.prior_v(torch.cat([ctx, u], dim=-1))
+            pv_ctx = self.pv_ctx(torch.cat([ctx, u], dim=-1))
+            p_v = self.prior_v(pv_ctx)
 
             log_pu = p_u.log_prob(u).squeeze(-1)  # (B,)
             log_pv = p_v.log_prob(v).squeeze(-1)  # (B,)
             log_px = self._sensor_joint_log_prob(source, u, v, upstream_speed, downstream_speed)  # (B,)
 
-            log_qu = q_u.log_prob(u).squeeze(-1)
-            log_qv = q_v.log_prob(v).squeeze(-1)
+            log_quv = q_uv.log_prob(z)  # (B,)
 
             log_p_terms.append(log_pu + log_pv)
-            log_q_terms.append(log_qu + log_qv)
+            log_q_terms.append(log_quv)
             log_px_terms.append(log_px)
 
-        log_p = torch.stack(log_p_terms, dim=0)  # (S,B)
-        log_q = torch.stack(log_q_terms, dim=0)  # (S,B)
-        log_px = torch.stack(log_px_terms, dim=0)  # (S,B)
-
-        elbo = (log_p + log_px - log_q).mean(dim=0).mean()
-        return elbo
+        log_p = torch.stack(log_p_terms, dim=0).mean(dim=0).mean()  # scalar
+        log_q = torch.stack(log_q_terms, dim=0).mean(dim=0).mean()  # scalar
+        log_px = torch.stack(log_px_terms, dim=0).mean(dim=0).mean()  # scalar
+        return log_p, log_q, log_px
 
     def loss(
         self,
@@ -377,23 +415,24 @@ class LatentModel(nn.Module):
         num_samples: int = 64,
     ) -> torch.Tensor:
         # IWAE estimate: log p(x) ~= log mean_s exp(log p(u,v,x) - log q(u,v|x))
-        ctx, q_u, q_v = self._encode(source, upstream_speed, downstream_speed)
+        ctx, q_uv = self._encode(source, upstream_speed, downstream_speed)
         p_u = self.prior_u(ctx)
 
         ws = []
         for _ in range(num_samples):
-            u = q_u.rsample()
-            v = q_v.rsample()
-            p_v = self.prior_v(torch.cat([ctx, u], dim=-1))
+            z = q_uv.rsample()  # (B,2)
+            u = z[:, 0:1]
+            v = z[:, 1:2]
+            pv_ctx = self.pv_ctx(torch.cat([ctx, u], dim=-1))
+            p_v = self.prior_v(pv_ctx)
 
             log_pu = p_u.log_prob(u).squeeze(-1)
             log_pv = p_v.log_prob(v).squeeze(-1)
             log_px = self._sensor_joint_log_prob(source, u, v, upstream_speed, downstream_speed)
 
-            log_qu = q_u.log_prob(u).squeeze(-1)
-            log_qv = q_v.log_prob(v).squeeze(-1)
+            log_quv = q_uv.log_prob(z)
 
-            ws.append((log_pu + log_pv + log_px) - (log_qu + log_qv))
+            ws.append((log_pu + log_pv + log_px) - (log_quv))
 
         w = torch.stack(ws, dim=0)  # (S,B)
         return torch.logsumexp(w, dim=0) - torch.log(torch.tensor(float(num_samples), device=w.device))  # (B,)
@@ -417,7 +456,8 @@ class LatentModel(nn.Module):
         ctx_rep = ctx.unsqueeze(0).expand(S, B, -1)  # (S,B,E)
         pv_ctx = torch.cat([ctx_rep, u_s], dim=-1)
         pv_ctx_flat = pv_ctx.reshape(S * B, -1)
-        p_v = self.prior_v(pv_ctx_flat)
+        pv_ctx_enc = self.pv_ctx(pv_ctx_flat)
+        p_v = self.prior_v(pv_ctx_enc)
         v_flat = p_v.sample()  # (S*B,1) or (S*B,)
         if v_flat.dim() == 1:
             v_flat = v_flat.unsqueeze(-1)

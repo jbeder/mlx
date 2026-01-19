@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import os
+from pathlib import Path
 from typing import TypeVar
 
 import pandas as pd
@@ -48,8 +48,10 @@ def _make_model(cfg: AppConfig, num_sources: int, kind: str) -> nn.Module:
         return LatentModel(
             num_sources=num_sources,
             emb_dim=cfg.model.latent.emb_dim,
-            num_components=cfg.model.latent.num_components,
+            num_components_u=cfg.model.latent.num_components_u,
+            num_components_v=cfg.model.latent.num_components_v,
             encoder_hidden=cfg.model.latent.encoder_hidden,
+            pv_ctx_hidden=cfg.model.latent.pv_ctx_hidden,
         )
 
     raise ValueError(f"Unknown model kind: {kind!r}")
@@ -64,8 +66,19 @@ def main() -> None:
     # Data location: allow either explicit --data or (--data_dir + --mode)
     default_data_dir = os.path.join(os.path.dirname(__file__), "data")
     ap.add_argument("--data", type=str, default=None, help="Input parquet file path (overrides --data_dir/--mode)")
-    ap.add_argument("--data_dir", type=str, default=default_data_dir, help=f"Directory containing parquet data (default: {default_data_dir})")
-    ap.add_argument("--mode", type=str, choices=["clean", "noisy"], default="clean", help="Dataset variant when using --data_dir (default: clean)")
+    ap.add_argument(
+        "--data_dir",
+        type=str,
+        default=default_data_dir,
+        help=f"Directory containing parquet data (default: {default_data_dir})",
+    )
+    ap.add_argument(
+        "--mode",
+        type=str,
+        choices=["clean", "noisy"],
+        default="clean",
+        help="Dataset variant when using --data_dir (default: clean)",
+    )
     ap.add_argument("--out_dir", type=str, required=True, help="Output directory for model + metrics")
     args = ap.parse_args()
 
@@ -94,6 +107,7 @@ def main() -> None:
     model = _make_model(cfg, num_sources=num_sources, kind=args.model).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
 
+    global_step = 0
     for epoch in range(cfg.train.epochs):
         model.train()
         running = 0.0
@@ -118,12 +132,21 @@ def main() -> None:
                 loss = ((-up_dist.log_prob(u)) + (-down_dist.log_prob(d))).mean()
 
             elif args.model == "latent":
-                loss = model.loss(
+                # KL annealing: scale KL term by beta in [start,end] over kl_anneal_steps
+                if cfg.model.latent.kl_anneal_steps > 0:
+                    t = min(1.0, global_step / float(cfg.model.latent.kl_anneal_steps))
+                else:
+                    t = 1.0
+                beta = (1.0 - t) * cfg.model.latent.kl_beta_start + t * cfg.model.latent.kl_beta_end
+
+                log_p, log_q, log_px = model.elbo_terms(
                     source,
                     upstream_speed,
                     downstream_speed,
                     num_samples=cfg.model.latent.elbo_samples,
                 )
+                # Negative ELBO with KL scaled by beta
+                loss = -(log_px + beta * (log_p - log_q))
             else:
                 raise ValueError(args.model)
 
@@ -136,6 +159,7 @@ def main() -> None:
 
             running += float(loss.detach().item())
             n_batches += 1
+            global_step += 1
 
         avg = running / max(1, n_batches)
         print(f"epoch={epoch + 1}/{cfg.train.epochs} loss={avg:.6f}")

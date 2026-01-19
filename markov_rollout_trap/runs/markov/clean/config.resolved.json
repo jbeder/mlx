@@ -14,7 +14,12 @@
       "elbo_samples": 1,
       "emb_dim": 8,
       "encoder_hidden": 64,
-      "num_components": 2
+      "kl_anneal_steps": 2000,
+      "kl_beta_end": 1.0,
+      "kl_beta_start": 0.0,
+      "num_components_u": 2,
+      "num_components_v": 4,
+      "pv_ctx_hidden": 64
     },
     "markov": {
       "emb_dim": 8,

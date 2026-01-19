@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import os
+from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
@@ -46,8 +46,10 @@ def _load_model(model_dir: Path, device: torch.device) -> Tuple[nn.Module, Dict]
         model = LatentModel(
             num_sources=num_sources,
             emb_dim=cfg.model.latent.emb_dim,
-            num_components=cfg.model.latent.num_components,
+            num_components_u=cfg.model.latent.num_components_u,
+            num_components_v=cfg.model.latent.num_components_v,
             encoder_hidden=cfg.model.latent.encoder_hidden,
+            pv_ctx_hidden=cfg.model.latent.pv_ctx_hidden,
         )
     else:
         raise ValueError(f"Unknown model_kind: {kind}")
@@ -200,8 +202,19 @@ def main() -> None:
     # Data location: allow either explicit --data or (--data_dir + --mode)
     default_data_dir = os.path.join(os.path.dirname(__file__), "data")
     ap.add_argument("--data", type=str, default=None, help="Input parquet file path (overrides --data_dir/--mode)")
-    ap.add_argument("--data_dir", type=str, default=default_data_dir, help=f"Directory containing parquet data (default: {default_data_dir})")
-    ap.add_argument("--mode", type=str, choices=["clean", "noisy"], default="clean", help="Dataset variant when using --data_dir (default: clean)")
+    ap.add_argument(
+        "--data_dir",
+        type=str,
+        default=default_data_dir,
+        help=f"Directory containing parquet data (default: {default_data_dir})",
+    )
+    ap.add_argument(
+        "--mode",
+        type=str,
+        choices=["clean", "noisy"],
+        default="clean",
+        help="Dataset variant when using --data_dir (default: clean)",
+    )
     ap.add_argument("--model", type=str, required=True, help="Model directory containing model.pt")
     ap.add_argument("--device", type=str, default="cpu", help="Torch device for evaluation (default: cpu)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
