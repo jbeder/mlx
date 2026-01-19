@@ -2,6 +2,7 @@ import argparse
 import os
 
 import numpy as np
+import pandas as pd
 import torch
 
 
@@ -39,8 +40,6 @@ def generate_data(mode: str, seed: int, sources: int, count: int):
         downstream_obs = downstream_latent + np.random.normal(0.0, sensor_sigma)
     else:
         raise ValueError("mode must be 'clean' or 'noisy'")
-
-    import pandas as pd
 
     df = pd.DataFrame(
         {
