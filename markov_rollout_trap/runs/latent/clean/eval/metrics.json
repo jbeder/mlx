@@ -1,25 +1,25 @@
 {
   "fit": {
     "downstream_tf": {
-      "crps_mean": 1.9993449449539185,
+      "crps_mean": 2.9205257892608643,
       "crps_name": "crps_is",
-      "nll_mean": 3.5099358558654785,
+      "nll_mean": 7.0091552734375,
       "nll_name": "nll_is",
-      "nll_q90": 7.355962753295898
+      "nll_q90": 16.70815086364746
     },
     "upstream": {
-      "crps_mean": 54.41053009033203,
+      "crps_mean": 54.786537170410156,
       "crps_name": "crps_mc",
-      "nll_mean": 7.369570255279541,
+      "nll_mean": 12.440812110900879,
       "nll_name": "nll_mc",
-      "nll_q90": 10.78272819519043
+      "nll_q90": 24.82571792602539
     }
   },
   "rollout": {
-    "downstream_mean_err": 43.802979600246815,
-    "downstream_q90_err": 22.08737011483079,
-    "downstream_var_ratio": 9287.865607104357,
-    "joint_energy": 113.27240747338925,
-    "upstream_var_ratio": 473.13601025747045
+    "downstream_mean_err": 81.27817119341698,
+    "downstream_q90_err": 20.38960857918626,
+    "downstream_var_ratio": 438017.1796799658,
+    "joint_energy": 110.10774930026645,
+    "upstream_var_ratio": 470.0714997737354
   }
 }
